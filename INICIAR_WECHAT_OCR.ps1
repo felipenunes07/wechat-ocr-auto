@@ -50,6 +50,9 @@ $recentFilesHours = 24
 $originalWaitSeconds = 90
 $tempCorrelationSeconds = 30
 $thumbCandidatesEnabled = $false
+$manualOrderGuardEnabled = $true
+$manualBurstGapSeconds = 2
+$manualBurstMaxSeconds = 8
 $resolutionMode = "db-first"
 $verificationColumnName = "STATUS_VERIFICACAO"
 $uiForceDownloadEnabled = $false
@@ -78,6 +81,9 @@ if (Test-Path $sinkConfigPath) {
   if ($sinkConfig.original_wait_seconds) { $originalWaitSeconds = [int]$sinkConfig.original_wait_seconds }
   if ($sinkConfig.temp_correlation_seconds) { $tempCorrelationSeconds = [int]$sinkConfig.temp_correlation_seconds }
   if ($null -ne $sinkConfig.thumb_candidates_enabled) { $thumbCandidatesEnabled = [bool]$sinkConfig.thumb_candidates_enabled }
+  if ($null -ne $sinkConfig.manual_order_guard_enabled) { $manualOrderGuardEnabled = [bool]$sinkConfig.manual_order_guard_enabled }
+  if ($sinkConfig.manual_burst_gap_seconds) { $manualBurstGapSeconds = [int]$sinkConfig.manual_burst_gap_seconds }
+  if ($sinkConfig.manual_burst_max_seconds) { $manualBurstMaxSeconds = [int]$sinkConfig.manual_burst_max_seconds }
   if ($sinkConfig.resolution_mode) { $resolutionMode = [string]$sinkConfig.resolution_mode }
   if ($sinkConfig.verification_column_name) { $verificationColumnName = [string]$sinkConfig.verification_column_name }
   if ($null -ne $sinkConfig.ui_force_download_enabled) { $uiForceDownloadEnabled = [bool]$sinkConfig.ui_force_download_enabled }
@@ -137,6 +143,9 @@ $arguments = @(
   "--original-wait-seconds", "$originalWaitSeconds",
   "--temp-correlation-seconds", "$tempCorrelationSeconds",
   "--thumb-candidates-enabled", ($(if ($thumbCandidatesEnabled) { "true" } else { "false" })),
+  "--manual-order-guard-enabled", ($(if ($manualOrderGuardEnabled) { "true" } else { "false" })),
+  "--manual-burst-gap-seconds", "$manualBurstGapSeconds",
+  "--manual-burst-max-seconds", "$manualBurstMaxSeconds",
   "--verification-column-name", $verificationColumnName,
   "--ui-force-download-enabled", ($(if ($uiForceDownloadEnabled) { "true" } else { "false" })),
   "--ui-force-delay-seconds", "$uiForceDelaySeconds",
@@ -212,6 +221,9 @@ if ($p) {
   }
   Write-Output "RESOLUTION_MODE=$resolutionMode"
   Write-Output "THUMB_CANDIDATES_ENABLED=$thumbCandidatesEnabled"
+  Write-Output "MANUAL_ORDER_GUARD_ENABLED=$manualOrderGuardEnabled"
+  Write-Output "MANUAL_BURST_GAP_SECONDS=$manualBurstGapSeconds"
+  Write-Output "MANUAL_BURST_MAX_SECONDS=$manualBurstMaxSeconds"
   Write-Output "DB_MERGE_PATH=$dbMergePath"
   Write-Output "UI_FORCE_DOWNLOAD_ENABLED=$uiForceDownloadEnabled"
   Write-Output "UI_FORCE_DELAY_SECONDS=$uiForceDelaySeconds"

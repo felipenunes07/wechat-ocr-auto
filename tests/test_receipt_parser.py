@@ -5,7 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wechat_receipt_daemon import (
+    IGNORED_SESSION_ROLLOVER_STATE,
+    SESSION_PENDING_OPEN_STATE,
     StateDB,
+    WeChatDBResolver,
     WeChatMessageRef,
     backfill_missing_receipt_fields,
     is_candidate,
@@ -13,6 +16,7 @@ from wechat_receipt_daemon import (
     normalize_client_label,
     parse_receipt_fields,
     round_amount_for_output,
+    seed_ready_manual_session_placeholders,
     should_ignore_sender,
 )
 
@@ -201,6 +205,7 @@ def build_receipt_payload(
     msg_create_time: float,
     amount: float,
     amount_rounded: float,
+    manual_session_id: str | None = None,
 ) -> dict[str, object]:
     row_payload = {
         "file_id": file_id,
@@ -242,6 +247,7 @@ def build_receipt_payload(
         "msg_svr_id": msg_svr_id,
         "talker": "27837425841@chatroom",
         "msg_create_time": msg_create_time,
+        "manual_session_id": manual_session_id,
         "resolved_media_path": f"C:/fake/{file_id}.dat",
         "resolution_source": "db_image",
         "verification_status": "CONFIRMADO",
@@ -264,14 +270,20 @@ def insert_file_row(
     status: str,
     first_seen: float,
     last_error: str | None,
+    msg_svr_id: str | None = None,
+    talker: str | None = None,
+    msg_create_time: float | None = None,
+    manual_session_id: str | None = None,
+    session_release_at: float = 0.0,
 ) -> None:
     db._conn.execute(
         """
         INSERT INTO files(
             file_id, path, source_kind, ext, size, mtime, ctime, status,
-            attempts, next_attempt, first_seen, last_seen, processed_at, sha256, last_error
+            attempts, next_attempt, first_seen, last_seen, msg_svr_id, talker, msg_create_time,
+            manual_session_id, session_release_at, processed_at, sha256, last_error
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
         """,
         (
             file_id,
@@ -286,10 +298,39 @@ def insert_file_row(
             first_seen + 5.0,
             first_seen,
             first_seen,
+            msg_svr_id,
+            talker,
+            msg_create_time,
+            manual_session_id,
+            session_release_at,
             last_error,
         ),
     )
     db._conn.commit()
+
+
+class FakeMediaResolver:
+    def __init__(self, messages: list[WeChatMessageRef]) -> None:
+        self.messages = messages
+
+    def list_image_messages_for_talker(
+        self,
+        talker: str | None,
+        start_create_time: float,
+        end_create_time: float,
+        limit: int = 240,
+    ) -> list[WeChatMessageRef]:
+        talker_value = str(talker or "").strip()
+        out = [
+            msg
+            for msg in self.messages
+            if str(msg.talker or "").strip() == talker_value
+            and float(start_create_time) <= float(msg.create_time) <= float(end_create_time)
+        ]
+        return out[:limit]
+
+    def resolve_talker_display_name(self, talker: str | None) -> str | None:
+        return str(talker or "").strip() or None
 
 
 class CandidateFilterTests(unittest.TestCase):
@@ -460,6 +501,219 @@ class ManualSessionOrderTests(unittest.TestCase):
                 self.assertIsNotNone(claimed)
                 self.assertEqual(claimed["source_first_seen"], 2000.0)
                 self.assertEqual(claimed["ingested_at"], 2100.0)
+            finally:
+                db.close()
+
+    def test_claim_next_orders_current_manual_session_by_message_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="newer-file",
+                    path="C:/fake/newer-file.dat",
+                    source_kind="msgattach_image_dat",
+                    status="pending",
+                    first_seen=1000.0,
+                    last_error=None,
+                    msg_svr_id="newer-msg",
+                    talker="27837425841@chatroom",
+                    msg_create_time=301.0,
+                    manual_session_id="session-a",
+                    session_release_at=1005.0,
+                )
+                insert_file_row(
+                    db,
+                    file_id="older-file",
+                    path="C:/fake/older-file.dat",
+                    source_kind="msgattach_image_dat",
+                    status="pending",
+                    first_seen=1002.0,
+                    last_error=None,
+                    msg_svr_id="older-msg",
+                    talker="27837425841@chatroom",
+                    msg_create_time=300.0,
+                    manual_session_id="session-a",
+                    session_release_at=1005.0,
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=1010.0):
+                    first_claim = db.claim_next(manual_session_id="session-a")
+                self.assertIsNotNone(first_claim)
+                self.assertEqual(first_claim.file_id, "older-file")
+
+                db.mark_done("older-file", sha256="sha-old", processed_at=1010.0)
+                with patch("wechat_receipt_daemon.time.time", return_value=1011.0):
+                    second_claim = db.claim_next(manual_session_id="session-a")
+                self.assertIsNotNone(second_claim)
+                self.assertEqual(second_claim.file_id, "newer-file")
+            finally:
+                db.close()
+
+    def test_seed_ready_manual_session_placeholders_only_within_burst_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                with patch("wechat_receipt_daemon.time.time", return_value=10.0):
+                    session = db.start_or_extend_manual_order_session(
+                        talker="27837425841@chatroom",
+                        create_time=100.0,
+                        event_ts=10.0,
+                        burst_gap_seconds=2,
+                        burst_max_seconds=8,
+                    )
+                self.assertIsNotNone(session)
+                with patch("wechat_receipt_daemon.time.time", return_value=11.0):
+                    db.start_or_extend_manual_order_session(
+                        talker="27837425841@chatroom",
+                        create_time=104.0,
+                        event_ts=11.0,
+                        burst_gap_seconds=2,
+                        burst_max_seconds=8,
+                        preferred_session_id=str(session["session_id"]),
+                    )
+
+                resolver = FakeMediaResolver(
+                    [
+                        WeChatMessageRef(
+                            msg_svr_id="msg-99",
+                            talker="27837425841@chatroom",
+                            create_time=99.0,
+                            sender_user_name=None,
+                            sender_display=None,
+                            image_rel_path=None,
+                            thumb_rel_path=None,
+                            image_abs_path=Path("C:/fake/msg-99.dat"),
+                            thumb_abs_path=None,
+                        ),
+                        WeChatMessageRef(
+                            msg_svr_id="msg-102",
+                            talker="27837425841@chatroom",
+                            create_time=102.0,
+                            sender_user_name=None,
+                            sender_display=None,
+                            image_rel_path=None,
+                            thumb_rel_path=None,
+                            image_abs_path=Path("C:/fake/msg-102.dat"),
+                            thumb_abs_path=None,
+                        ),
+                    ]
+                )
+
+                class Cfg:
+                    manual_order_guard_enabled = True
+
+                seeded = seed_ready_manual_session_placeholders(db, resolver, Cfg())
+
+                self.assertEqual(seeded, 1)
+                self.assertIsNone(db.get_message_job("msg-99"))
+                placeholder = db.get_message_job("msg-102")
+                self.assertIsNotNone(placeholder)
+                self.assertEqual(placeholder["state"], SESSION_PENDING_OPEN_STATE)
+                self.assertEqual(placeholder["manual_session_id"], session["session_id"])
+            finally:
+                db.close()
+
+    def test_new_talker_rolls_previous_session_placeholders_and_releases_file_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                with patch("wechat_receipt_daemon.time.time", return_value=10.0):
+                    first_session = db.start_or_extend_manual_order_session(
+                        talker="27837425841@chatroom",
+                        create_time=100.0,
+                        event_ts=10.0,
+                        burst_gap_seconds=2,
+                        burst_max_seconds=8,
+                    )
+                self.assertIsNotNone(first_session)
+                db.ensure_message_job(
+                    msg_svr_id="old-msg",
+                    talker="27837425841@chatroom",
+                    talker_display="Grupo 65",
+                    thumb_path=None,
+                    expected_image_path=Path("C:/fake/old-msg.dat"),
+                    create_time=100.0,
+                    first_seen_at=10.0,
+                    manual_session_id=str(first_session["session_id"]),
+                    state=SESSION_PENDING_OPEN_STATE,
+                    activation_seen_at=0.0,
+                )
+                insert_file_row(
+                    db,
+                    file_id="held-file",
+                    path="C:/fake/held-file.dat",
+                    source_kind="msgattach_image_dat",
+                    status="retry",
+                    first_seen=12.0,
+                    last_error="WAITING_SESSION_PRIOR_MESSAGE_ORDER:old-msg",
+                    msg_svr_id="new-msg",
+                    talker="27837425841@chatroom",
+                    msg_create_time=101.0,
+                    manual_session_id=str(first_session["session_id"]),
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=20.0):
+                    second_session = db.start_or_extend_manual_order_session(
+                        talker="wxid_other_chat",
+                        create_time=200.0,
+                        event_ts=20.0,
+                        burst_gap_seconds=2,
+                        burst_max_seconds=8,
+                    )
+
+                self.assertIsNotNone(second_session)
+                self.assertNotEqual(first_session["session_id"], second_session["session_id"])
+                rolled_job = db.get_message_job("old-msg")
+                self.assertIsNotNone(rolled_job)
+                self.assertEqual(rolled_job["state"], IGNORED_SESSION_ROLLOVER_STATE)
+                held_file = db.get_file("held-file")
+                self.assertIsNotNone(held_file)
+                self.assertEqual(held_file["status"], "retry")
+                self.assertEqual(held_file["last_error"], IGNORED_SESSION_ROLLOVER_STATE)
+            finally:
+                db.close()
+
+    def test_sink_claim_waits_for_prior_session_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                db.ensure_message_job(
+                    msg_svr_id="older-msg",
+                    talker="27837425841@chatroom",
+                    talker_display="Grupo 65",
+                    thumb_path=None,
+                    expected_image_path=Path("C:/fake/older-msg.dat"),
+                    create_time=300.0,
+                    first_seen_at=1000.0,
+                    manual_session_id="session-a",
+                    state=SESSION_PENDING_OPEN_STATE,
+                    activation_seen_at=0.0,
+                )
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="newer-file",
+                        ingested_at=2000.0,
+                        msg_svr_id="newer-msg",
+                        msg_create_time=301.0,
+                        amount=668.04,
+                        amount_rounded=668.0,
+                        manual_session_id="session-a",
+                    )
+                )
+
+                claimed = db.claim_next_sink_receipt(manual_session_id="session-a")
+
+                self.assertIsNone(claimed)
+                row = db._conn.execute(
+                    """
+                    SELECT sheet_status, sheet_last_error
+                    FROM receipts
+                    WHERE file_id='newer-file'
+                    """
+                ).fetchone()
+                self.assertEqual(row["sheet_status"], "SINK_BLOCKED_PRIOR_MSG")
+                self.assertEqual(row["sheet_last_error"], "WAITING_PRIOR_SINK_SESSION_MESSAGE:older-msg")
             finally:
                 db.close()
 

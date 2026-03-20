@@ -82,13 +82,29 @@ BASE_LANC_HEADERS = [
 DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
+MANUAL_SESSION_ID_META_KEY = "manual_session_id"
 REALTIME_SOURCE_EVENTS = {"created", "modified", "ui-force"}
 MANUAL_OPEN_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "temp_image"}
 MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
+SESSION_PENDING_OPEN_STATE = "SESSION_PENDING_OPEN"
+IGNORED_SESSION_ROLLOVER_STATE = "IGNORED_SESSION_ROLLOVER"
+IGNORED_STALE_MANUAL_SESSION_STATE = "IGNORED_STALE_MANUAL_SESSION"
+MANUAL_SESSION_TERMINAL_STATES = {
+    "RESOLVED",
+    "THUMB_FALLBACK",
+    "EXCEPTION",
+    IGNORED_SESSION_ROLLOVER_STATE,
+    IGNORED_STALE_MANUAL_SESSION_STATE,
+}
 MANUAL_OPEN_ONLY_WAIT_REASONS = (
     "MANUAL_WAIT_ORIGINAL",
     "WAITING_ORIGINAL_MEDIA",
     "WAITING_TEMP_CONTEXT",
+)
+MANUAL_SESSION_FILE_HOLD_PREFIXES = (
+    "WAITING_SESSION_PRIOR_MESSAGE_ORDER:",
+    "WAITING_PRIOR_SINK_SESSION_MESSAGE:",
+    "WAITING_PRIOR_SINK_RECEIPT:",
 )
 
 
@@ -119,6 +135,10 @@ def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
 
 def should_refresh_manual_session(source_kind: str, source_event: str) -> bool:
     return source_kind in MANUAL_OPEN_SOURCE_KINDS and str(source_event or "").strip().lower() in REALTIME_SOURCE_EVENTS
+
+
+def is_message_job_terminal_state(state: Optional[str]) -> bool:
+    return str(state or "").strip().upper() in MANUAL_SESSION_TERMINAL_STATES
 
 
 def wall_duration_ms(start_ts: float | None, end_ts: float | None = None) -> Optional[float]:
@@ -1141,6 +1161,11 @@ class QueueItem:
     mtime: float
     first_seen: float
     attempts: int
+    msg_svr_id: Optional[str] = None
+    talker: Optional[str] = None
+    msg_create_time: float = 0.0
+    manual_session_id: Optional[str] = None
+    session_release_at: float = 0.0
 
 
 @dataclass
@@ -1502,6 +1527,63 @@ class WeChatDBResolver:
             return None
         return next(iter(unique.values()))
 
+    def list_image_messages_for_talker(
+        self,
+        talker: Optional[str],
+        start_create_time: float,
+        end_create_time: float,
+        limit: int = 240,
+    ) -> list[WeChatMessageRef]:
+        talker_value = str(talker or "").strip()
+        if not talker_value:
+            return []
+        lower = int(min(float(start_create_time or 0.0), float(end_create_time or 0.0)))
+        upper = int(max(float(start_create_time or 0.0), float(end_create_time or 0.0)))
+        if upper <= 0:
+            return []
+        if not self.refresh_if_due():
+            return []
+        if not self.merge_path.exists():
+            return []
+
+        conn = sqlite3.connect(str(self.merge_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                FROM MSG
+                WHERE Type=3
+                  AND StrTalker=?
+                  AND CreateTime BETWEEN ? AND ?
+                ORDER BY CreateTime ASC, MsgSvrID ASC
+                LIMIT ?
+                """,
+                (talker_value, lower, upper, int(max(1, limit))),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        out: list[WeChatMessageRef] = []
+        for row in rows:
+            image_rel, thumb_rel, sender_user_name = self._extract_media_paths(row["BytesExtra"])
+            if not image_rel and not thumb_rel:
+                continue
+            out.append(
+                WeChatMessageRef(
+                    msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
+                    talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
+                    create_time=float(row["CreateTime"]),
+                    sender_user_name=sender_user_name,
+                    sender_display=None,
+                    image_rel_path=image_rel,
+                    thumb_rel_path=thumb_rel,
+                    image_abs_path=self._absolute_path_from_rel(image_rel),
+                    thumb_abs_path=self._absolute_path_from_rel(thumb_rel),
+                )
+            )
+        return out
+
     def resolve_contact_display_name(self, username: Optional[str]) -> Optional[str]:
         username = str(username or "").strip()
         if not username:
@@ -1568,6 +1650,11 @@ class StateDB:
                     next_attempt REAL NOT NULL DEFAULT 0,
                     first_seen REAL NOT NULL,
                     last_seen REAL NOT NULL,
+                    msg_svr_id TEXT,
+                    talker TEXT,
+                    msg_create_time REAL,
+                    manual_session_id TEXT,
+                    session_release_at REAL NOT NULL DEFAULT 0,
                     processed_at REAL,
                     sha256 TEXT,
                     last_error TEXT
@@ -1599,6 +1686,7 @@ class StateDB:
                     msg_svr_id TEXT,
                     talker TEXT,
                     msg_create_time REAL,
+                    manual_session_id TEXT,
                     resolved_media_path TEXT,
                     resolution_source TEXT,
                     verification_status TEXT,
@@ -1625,7 +1713,20 @@ class StateDB:
                     ui_force_attempts INTEGER NOT NULL DEFAULT 0,
                     next_ui_attempt_at REAL NOT NULL DEFAULT 0,
                     last_ui_result TEXT,
-                    batch_id TEXT
+                    batch_id TEXT,
+                    manual_session_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS manual_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    talker TEXT NOT NULL,
+                    started_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    release_at REAL NOT NULL,
+                    max_release_at REAL NOT NULL,
+                    min_create_time REAL,
+                    max_create_time REAL,
+                    range_seeded INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
@@ -1639,6 +1740,7 @@ class StateDB:
             self._ensure_column_exists(cur, "receipts", "msg_svr_id", "TEXT")
             self._ensure_column_exists(cur, "receipts", "talker", "TEXT")
             self._ensure_column_exists(cur, "receipts", "msg_create_time", "REAL")
+            self._ensure_column_exists(cur, "receipts", "manual_session_id", "TEXT")
             self._ensure_column_exists(cur, "receipts", "resolved_media_path", "TEXT")
             self._ensure_column_exists(cur, "receipts", "resolution_source", "TEXT")
             self._ensure_column_exists(cur, "receipts", "verification_status", "TEXT")
@@ -1652,14 +1754,24 @@ class StateDB:
             self._ensure_column_exists(cur, "receipts", "sheet_next_attempt", "REAL")
             self._ensure_column_exists(cur, "receipts", "sheet_last_error", "TEXT")
             self._ensure_column_exists(cur, "receipts", "sheet_committed_at", "REAL")
+            self._ensure_column_exists(cur, "files", "msg_svr_id", "TEXT")
+            self._ensure_column_exists(cur, "files", "talker", "TEXT")
+            self._ensure_column_exists(cur, "files", "msg_create_time", "REAL")
+            self._ensure_column_exists(cur, "files", "manual_session_id", "TEXT")
+            self._ensure_column_exists(cur, "files", "session_release_at", "REAL NOT NULL DEFAULT 0")
             self._ensure_column_exists(cur, "message_jobs", "activation_seen_at", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column_exists(cur, "message_jobs", "manual_session_id", "TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sha256 ON receipts(sha256)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_msg_svr_id ON receipts(msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sheet_status_next ON receipts(sheet_status, sheet_next_attempt, msg_create_time)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_talker_msg_order ON receipts(talker, msg_create_time, msg_svr_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_manual_session_order ON receipts(manual_session_id, talker, msg_create_time, msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_state_next ON message_jobs(state, next_ui_attempt_at, first_seen_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_talker_state ON message_jobs(talker, state, create_time DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_expected_path ON message_jobs(expected_image_path)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_manual_session ON message_jobs(manual_session_id, talker, create_time, msg_svr_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_session_order ON files(manual_session_id, talker, msg_create_time, next_attempt)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_manual_sessions_state_release ON manual_sessions(state, release_at, last_seen_at)")
             cur.execute(
                 """
                 UPDATE receipts
@@ -1786,6 +1898,345 @@ class StateDB:
         if refresh_manual_session:
             self.start_manual_session(now)
         return candidate_id
+
+    def get_file(self, file_id: Optional[str]) -> Optional[sqlite3.Row]:
+        file_id_value = str(file_id or "").strip()
+        if not file_id_value:
+            return None
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT *
+                FROM files
+                WHERE file_id=?
+                LIMIT 1
+                """,
+                (file_id_value,),
+            ).fetchone()
+
+    def update_file_message_context(
+        self,
+        file_id: Optional[str],
+        *,
+        msg_svr_id: Optional[str],
+        talker: Optional[str],
+        msg_create_time: float,
+        manual_session_id: Optional[str],
+        session_release_at: float,
+    ) -> None:
+        file_id_value = str(file_id or "").strip()
+        if not file_id_value:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE files
+                SET msg_svr_id=COALESCE(NULLIF(?, ''), msg_svr_id),
+                    talker=COALESCE(NULLIF(?, ''), talker),
+                    msg_create_time=CASE
+                        WHEN ? > 0 THEN ?
+                        ELSE msg_create_time
+                    END,
+                    manual_session_id=COALESCE(NULLIF(?, ''), manual_session_id),
+                    session_release_at=CASE
+                        WHEN ? > COALESCE(session_release_at, 0) THEN ?
+                        ELSE COALESCE(session_release_at, 0)
+                    END
+                WHERE file_id=?
+                """,
+                (
+                    str(msg_svr_id or "").strip(),
+                    str(talker or "").strip(),
+                    float(msg_create_time or 0.0),
+                    float(msg_create_time or 0.0),
+                    str(manual_session_id or "").strip(),
+                    float(session_release_at or 0.0),
+                    float(session_release_at or 0.0),
+                    file_id_value,
+                ),
+            )
+            self._conn.commit()
+
+    def get_current_manual_session_id(self) -> Optional[str]:
+        raw = self.get_meta(MANUAL_SESSION_ID_META_KEY)
+        value = str(raw or "").strip()
+        return value or None
+
+    def _set_current_manual_session_id_locked(self, cur: sqlite3.Cursor, session_id: Optional[str], now: float) -> None:
+        cur.execute(
+            """
+            INSERT INTO meta(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (MANUAL_SESSION_ID_META_KEY, str(session_id or "").strip(), float(now)),
+        )
+
+    def _release_manual_session_file_holds_locked(self, cur: sqlite3.Cursor, session_id: str, reason: str, now: float) -> int:
+        cur.execute(
+            """
+            UPDATE files
+            SET status='retry',
+                next_attempt=?,
+                last_error=?
+            WHERE manual_session_id=?
+              AND status IN ('pending', 'retry')
+              AND (
+                    last_error LIKE 'WAITING_SESSION_PRIOR_MESSAGE_ORDER:%'
+                 OR last_error LIKE 'WAITING_PRIOR_SINK_SESSION_MESSAGE:%'
+                 OR last_error LIKE 'WAITING_PRIOR_SINK_RECEIPT:%'
+              )
+            """,
+            (float(now), reason[:1200], str(session_id)),
+        )
+        return int(cur.rowcount or 0)
+
+    def _rollover_manual_sessions_locked(
+        self,
+        cur: sqlite3.Cursor,
+        session_ids: list[str],
+        reason: str,
+        now: float,
+    ) -> tuple[int, int]:
+        ignored_placeholders = 0
+        released_files = 0
+        for session_id in session_ids:
+            if not session_id:
+                continue
+            cur.execute(
+                """
+                UPDATE manual_sessions
+                SET state='ROLLED', last_seen_at=?
+                WHERE session_id=?
+                """,
+                (float(now), str(session_id)),
+            )
+            cur.execute(
+                """
+                UPDATE message_jobs
+                SET state=?,
+                    last_seen_at=?,
+                    last_ui_result=?
+                WHERE manual_session_id=?
+                  AND state=?
+                """,
+                (reason, float(now), reason[:1200], str(session_id), SESSION_PENDING_OPEN_STATE),
+            )
+            ignored_placeholders += int(cur.rowcount or 0)
+            released_files += self._release_manual_session_file_holds_locked(cur, str(session_id), reason, now)
+        return ignored_placeholders, released_files
+
+    def get_manual_session(self, session_id: Optional[str]) -> Optional[sqlite3.Row]:
+        session_value = str(session_id or "").strip()
+        if not session_value:
+            return None
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT *
+                FROM manual_sessions
+                WHERE session_id=?
+                LIMIT 1
+                """,
+                (session_value,),
+            ).fetchone()
+
+    def start_or_extend_manual_order_session(
+        self,
+        *,
+        talker: Optional[str],
+        create_time: float,
+        event_ts: float,
+        burst_gap_seconds: int,
+        burst_max_seconds: int,
+        preferred_session_id: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        talker_value = str(talker or "").strip()
+        if not talker_value:
+            return None
+
+        now = float(event_ts or time.time())
+        gap_seconds = max(1, int(burst_gap_seconds))
+        max_seconds = max(gap_seconds, int(burst_max_seconds))
+        preferred_value = str(preferred_session_id or "").strip()
+        result_session_id: Optional[str] = None
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            session_row: Optional[sqlite3.Row] = None
+            if preferred_value:
+                session_row = cur.execute(
+                    """
+                    SELECT *
+                    FROM manual_sessions
+                    WHERE session_id=? AND state='ACTIVE'
+                    LIMIT 1
+                    """,
+                    (preferred_value,),
+                ).fetchone()
+
+            if session_row is None:
+                active_same = cur.execute(
+                    """
+                    SELECT *
+                    FROM manual_sessions
+                    WHERE talker=? AND state='ACTIVE'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (talker_value,),
+                ).fetchone()
+                if active_same is not None:
+                    still_extendable = (
+                        int(active_same["range_seeded"] or 0) == 0
+                        and now <= float(active_same["max_release_at"] or 0.0)
+                        and now <= float(active_same["last_seen_at"] or 0.0) + float(gap_seconds)
+                    )
+                    session_row = active_same if still_extendable else None
+                    if active_same is not None and session_row is None:
+                        self._rollover_manual_sessions_locked(
+                            cur,
+                            [str(active_same["session_id"])],
+                            IGNORED_SESSION_ROLLOVER_STATE,
+                            now,
+                        )
+
+            if session_row is None:
+                other_active_ids = [
+                    str(row["session_id"])
+                    for row in cur.execute(
+                        """
+                        SELECT session_id
+                        FROM manual_sessions
+                        WHERE state='ACTIVE'
+                        """
+                    ).fetchall()
+                ]
+                if other_active_ids:
+                    self._rollover_manual_sessions_locked(cur, other_active_ids, IGNORED_SESSION_ROLLOVER_STATE, now)
+
+                session_id = hashlib.sha1(f"{talker_value}|{now:.6f}".encode("utf-8")).hexdigest()[:16]
+                release_at = now + float(gap_seconds)
+                max_release_at = now + float(max_seconds)
+                min_create = float(create_time) if float(create_time or 0.0) > 0 else None
+                max_create = float(create_time) if float(create_time or 0.0) > 0 else None
+                cur.execute(
+                    """
+                    INSERT INTO manual_sessions(
+                        session_id, talker, started_at, last_seen_at, release_at, max_release_at,
+                        min_create_time, max_create_time, range_seeded, state
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 'ACTIVE')
+                    """,
+                    (
+                        session_id,
+                        talker_value,
+                        float(now),
+                        float(now),
+                        float(release_at),
+                        float(max_release_at),
+                        min_create,
+                        max_create,
+                    ),
+                )
+                self._set_current_manual_session_id_locked(cur, session_id, now)
+                self._conn.commit()
+                result_session_id = session_id
+            else:
+                session_id = str(session_row["session_id"])
+                release_at = float(session_row["release_at"] or 0.0)
+                if int(session_row["range_seeded"] or 0) == 0:
+                    release_at = min(
+                        float(session_row["max_release_at"] or now),
+                        max(float(session_row["release_at"] or 0.0), now + float(gap_seconds)),
+                    )
+                min_create = float(session_row["min_create_time"] or 0.0)
+                max_create = float(session_row["max_create_time"] or 0.0)
+                create_value = float(create_time or 0.0)
+                if create_value > 0:
+                    min_create = create_value if min_create <= 0 else min(min_create, create_value)
+                    max_create = create_value if max_create <= 0 else max(max_create, create_value)
+                cur.execute(
+                    """
+                    UPDATE manual_sessions
+                    SET last_seen_at=?,
+                        release_at=?,
+                        min_create_time=?,
+                        max_create_time=?
+                    WHERE session_id=?
+                    """,
+                    (
+                        float(now),
+                        float(release_at),
+                        min_create if min_create > 0 else None,
+                        max_create if max_create > 0 else None,
+                        session_id,
+                    ),
+                )
+                self._set_current_manual_session_id_locked(cur, session_id, now)
+                self._conn.commit()
+                result_session_id = session_id
+
+        return self.get_manual_session(result_session_id)
+
+    def list_manual_sessions_ready_for_seed(self, now: Optional[float] = None) -> list[sqlite3.Row]:
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM manual_sessions
+                WHERE state='ACTIVE'
+                  AND range_seeded=0
+                  AND release_at <= ?
+                ORDER BY started_at ASC
+                """,
+                (moment,),
+            ).fetchall()
+        return list(rows)
+
+    def mark_manual_session_seeded(self, session_id: Optional[str]) -> None:
+        session_value = str(session_id or "").strip()
+        if not session_value:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE manual_sessions
+                SET range_seeded=1
+                WHERE session_id=?
+                """,
+                (session_value,),
+            )
+            self._conn.commit()
+
+    def ignore_stale_manual_sessions(self, max_age_sec: int = 1800) -> tuple[int, int]:
+        threshold = time.time() - max(60, int(max_age_sec))
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            session_ids = [
+                str(row["session_id"])
+                for row in cur.execute(
+                    """
+                    SELECT session_id
+                    FROM manual_sessions
+                    WHERE state='ACTIVE'
+                      AND last_seen_at <= ?
+                    """,
+                    (float(threshold),),
+                ).fetchall()
+            ]
+            ignored_placeholders, released_files = self._rollover_manual_sessions_locked(
+                cur,
+                session_ids,
+                IGNORED_STALE_MANUAL_SESSION_STATE,
+                now,
+            )
+            self._conn.commit()
+            return ignored_placeholders, released_files
 
     def get_meta(self, key: str) -> Optional[str]:
         with self._lock:
@@ -1965,6 +2416,7 @@ class StateDB:
                       AND (
                         last_error IN (?, ?, ?)
                         OR last_error LIKE 'WAITING_PRIOR_MESSAGE_ORDER:%'
+                        OR last_error LIKE 'WAITING_SESSION_PRIOR_MESSAGE_ORDER:%'
                       )
                     """,
                     MANUAL_OPEN_ONLY_WAIT_REASONS,
@@ -1984,6 +2436,7 @@ class StateDB:
                   AND (
                     last_error IN (?, ?, ?)
                     OR last_error LIKE 'WAITING_PRIOR_MESSAGE_ORDER:%'
+                    OR last_error LIKE 'WAITING_SESSION_PRIOR_MESSAGE_ORDER:%'
                   )
                 """,
                 (float(now), MANUAL_OPEN_ONLY_IGNORE_REASON, *MANUAL_OPEN_ONLY_WAIT_REASONS),
@@ -2083,41 +2536,54 @@ class StateDB:
             return next(iter(unique_groups.values()))
         return None
 
-    def claim_next(self, manual_session_started_at: Optional[float] = None) -> Optional[QueueItem]:
+    def claim_next(
+        self,
+        manual_session_started_at: Optional[float] = None,
+        manual_session_id: Optional[str] = None,
+    ) -> Optional[QueueItem]:
         now = time.time()
         session_floor = float(manual_session_started_at or 0.0)
+        session_id_value = str(manual_session_id or "").strip()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
             row = cur.execute(
                 """
-                SELECT f.file_id, f.path, f.source_kind, f.ext, f.size, f.mtime, f.first_seen, f.attempts
+                SELECT f.file_id, f.path, f.source_kind, f.ext, f.size, f.mtime, f.first_seen, f.attempts,
+                       f.msg_svr_id, f.talker, f.msg_create_time, f.manual_session_id, f.session_release_at
                 FROM files AS f
-                LEFT JOIN message_jobs AS mj
-                  ON mj.thumb_path=f.path OR mj.expected_image_path=f.path
                 WHERE f.status IN ('pending', 'retry')
                   AND f.next_attempt <= ?
+                  AND COALESCE(f.session_release_at, 0) <= ?
                 ORDER BY
                     CASE
-                        WHEN ? > 0 AND (
-                            CASE
-                                WHEN COALESCE(mj.activation_seen_at, mj.first_seen_at, 0) > COALESCE(f.first_seen, 0)
-                                    THEN COALESCE(mj.activation_seen_at, mj.first_seen_at, 0)
-                                ELSE COALESCE(f.first_seen, 0)
-                            END
-                        ) >= ? THEN 0
+                        WHEN ? <> '' AND COALESCE(f.manual_session_id, '') = ? THEN 0
+                        WHEN ? <> '' THEN 1
+                        ELSE 0
+                    END ASC,
+                    CASE
+                        WHEN ? > 0 AND COALESCE(f.first_seen, 0) >= ? THEN 0
                         WHEN ? > 0 THEN 1
                         ELSE 0
                     END ASC,
-                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN 0 ELSE 1 END ASC,
-                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.create_time END ASC,
-                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.msg_svr_id END ASC,
-                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.first_seen END ASC,
-                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.mtime END ASC,
+                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN 0 ELSE 1 END ASC,
+                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_create_time END ASC,
+                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_svr_id END ASC,
+                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.first_seen END ASC,
+                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.mtime END ASC,
                     f.next_attempt ASC
                 LIMIT 1
                 """,
-                (float(now), session_floor, session_floor, session_floor),
+                (
+                    float(now),
+                    float(now),
+                    session_id_value,
+                    session_id_value,
+                    session_id_value,
+                    session_floor,
+                    session_floor,
+                    session_floor,
+                ),
             ).fetchone()
             if row is None:
                 self._conn.commit()
@@ -2141,6 +2607,11 @@ class StateDB:
                 mtime=float(row["mtime"]),
                 first_seen=float(row["first_seen"]),
                 attempts=next_attempt_count,
+                msg_svr_id=str(row["msg_svr_id"] or "").strip() or None,
+                talker=str(row["talker"] or "").strip() or None,
+                msg_create_time=float(row["msg_create_time"] or 0.0),
+                manual_session_id=str(row["manual_session_id"] or "").strip() or None,
+                session_release_at=float(row["session_release_at"] or 0.0),
             )
 
     def mark_done(self, file_id: str, sha256: str, processed_at: float, note: Optional[str] = None) -> None:
@@ -2386,13 +2857,13 @@ class StateDB:
                     file_id, source_path, source_kind, ingested_at, sha256,
                     txn_date, txn_time, client, bank, beneficiary, amount, currency,
                     parse_conf, quality_score, ocr_engine, ocr_conf, ocr_chars,
-                    review_needed, ocr_text, parser_json, msg_svr_id, talker, msg_create_time,
+                    review_needed, ocr_text, parser_json, msg_svr_id, talker, msg_create_time, manual_session_id,
                     resolved_media_path, resolution_source, verification_status,
                     txn_date_source, txn_time_source, amount_raw, amount_rounded, amount_source,
                     sheet_status, sheet_payload_json, sheet_next_attempt, sheet_last_error, sheet_committed_at,
                     excel_sheet, excel_row
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     payload["file_id"],
@@ -2418,6 +2889,7 @@ class StateDB:
                     payload.get("msg_svr_id"),
                     payload.get("talker"),
                     payload.get("msg_create_time"),
+                    payload.get("manual_session_id"),
                     payload.get("resolved_media_path"),
                     payload.get("resolution_source"),
                     payload.get("verification_status"),
@@ -2451,22 +2923,25 @@ class StateDB:
         msg_svr_id: Optional[str],
         file_id: str,
         manual_session_started_at: Optional[float] = None,
+        manual_session_id: Optional[str] = None,
     ) -> Optional[sqlite3.Row]:
         talker_value = str(talker or "").strip()
         if not talker_value or msg_create_time <= 0:
             return None
         sort_key = self._receipt_message_sort_key(msg_svr_id, file_id)
         session_floor = float(manual_session_started_at or 0.0)
+        session_id_value = str(manual_session_id or "").strip()
         with self._lock:
             return self._conn.execute(
                 """
-                SELECT file_id, msg_svr_id, msg_create_time, sheet_status, ingested_at
+                SELECT file_id, msg_svr_id, msg_create_time, sheet_status, ingested_at, manual_session_id
                 FROM receipts
                 WHERE talker=?
                   AND file_id<>?
                   AND msg_create_time IS NOT NULL
                   AND msg_create_time > 0
                   AND COALESCE(sheet_status, '') NOT IN ('SINK_COMMITTED', 'SINK_SKIPPED_TERMINAL')
+                  AND (? = '' OR COALESCE(manual_session_id, '') = ?)
                   AND (? <= 0 OR COALESCE(ingested_at, 0) >= ?)
                   AND (
                     msg_create_time < ?
@@ -2478,7 +2953,17 @@ class StateDB:
                 ORDER BY msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC
                 LIMIT 1
                 """,
-                (talker_value, str(file_id), session_floor, session_floor, float(msg_create_time), float(msg_create_time), sort_key),
+                (
+                    talker_value,
+                    str(file_id),
+                    session_id_value,
+                    session_id_value,
+                    session_floor,
+                    session_floor,
+                    float(msg_create_time),
+                    float(msg_create_time),
+                    sort_key,
+                ),
             ).fetchone()
 
     def claim_next_sink_receipt(
@@ -2486,6 +2971,7 @@ class StateDB:
         sheet_order_scope: str = "per_talker",
         commit_order: str = "asc",
         manual_session_started_at: Optional[float] = None,
+        manual_session_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         now = time.time()
         scope = str(sheet_order_scope or "per_talker").strip().lower() or "per_talker"
@@ -2494,6 +2980,7 @@ class StateDB:
         if order == "desc":
             order_by = "r.msg_create_time DESC, COALESCE(NULLIF(r.msg_svr_id, ''), 'file:' || r.file_id) DESC"
         session_floor = float(manual_session_started_at or 0.0)
+        session_id_value = str(manual_session_id or "").strip()
 
         with self._lock:
             cur = self._conn.cursor()
@@ -2501,7 +2988,7 @@ class StateDB:
             rows = cur.execute(
                 f"""
                 SELECT r.file_id, r.source_path, r.ingested_at, r.review_needed, r.msg_svr_id, r.talker,
-                       r.msg_create_time, r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
+                       r.msg_create_time, r.manual_session_id, r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
                        r.sheet_payload_json, r.sheet_status, f.first_seen AS source_first_seen
                 FROM receipts AS r
                 LEFT JOIN files AS f
@@ -2509,6 +2996,11 @@ class StateDB:
                 WHERE COALESCE(r.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
                   AND COALESCE(r.sheet_next_attempt, 0) <= ?
                 ORDER BY
+                    CASE
+                        WHEN ? <> '' AND COALESCE(r.manual_session_id, '') = ? THEN 0
+                        WHEN ? <> '' THEN 1
+                        ELSE 0
+                    END ASC,
                     CASE
                         WHEN ? > 0 AND COALESCE(r.ingested_at, 0) >= ? THEN 0
                         WHEN ? > 0 THEN 1
@@ -2522,7 +3014,15 @@ class StateDB:
                     {order_by},
                     r.ingested_at ASC
                 """,
-                (float(now), session_floor, session_floor, session_floor),
+                (
+                    float(now),
+                    session_id_value,
+                    session_id_value,
+                    session_id_value,
+                    session_floor,
+                    session_floor,
+                    session_floor,
+                ),
             ).fetchall()
 
             for row in rows:
@@ -2530,6 +3030,7 @@ class StateDB:
                 msg_svr_id = str(row["msg_svr_id"] or "").strip() or None
                 talker = str(row["talker"] or "").strip() or None
                 msg_create_time = float(row["msg_create_time"] or 0.0)
+                receipt_session_id = str(row["manual_session_id"] or "").strip() or None
                 blocker_note: Optional[str] = None
                 if scope == "per_talker" and talker and msg_create_time > 0:
                     prior_sink = self.find_prior_pending_sink_receipt(
@@ -2538,6 +3039,7 @@ class StateDB:
                         msg_svr_id=msg_svr_id,
                         file_id=file_id,
                         manual_session_started_at=session_floor,
+                        manual_session_id=receipt_session_id,
                     )
                     if prior_sink is not None:
                         blocker_id = self._receipt_message_sort_key(prior_sink["msg_svr_id"], str(prior_sink["file_id"]))
@@ -2548,9 +3050,10 @@ class StateDB:
                             create_time=msg_create_time,
                             msg_svr_id=msg_svr_id,
                             manual_session_started_at=session_floor,
+                            manual_session_id=receipt_session_id,
                         )
                         if prior_job is not None:
-                            blocker_note = f"WAITING_PRIOR_SINK_MESSAGE:{str(prior_job['msg_svr_id'])}"
+                            blocker_note = f"WAITING_PRIOR_SINK_SESSION_MESSAGE:{str(prior_job['msg_svr_id'])}"
 
                 if blocker_note:
                     cur.execute(
@@ -2601,6 +3104,7 @@ class StateDB:
                     "msg_svr_id": msg_svr_id,
                     "talker": talker,
                     "msg_create_time": msg_create_time,
+                    "manual_session_id": receipt_session_id,
                     "row_payload": payload,
                 }
 
@@ -2648,6 +3152,9 @@ class StateDB:
         expected_image_path: Optional[Path],
         create_time: float,
         first_seen_at: float,
+        manual_session_id: Optional[str] = None,
+        state: str = "NEW",
+        activation_seen_at: Optional[float] = None,
     ) -> None:
         msg_svr_id = str(msg_svr_id or "").strip()
         talker = str(talker or "").strip()
@@ -2659,10 +3166,11 @@ class StateDB:
         thumb_str = str(thumb_path) if thumb_path else None
         display_str = str(talker_display or "").strip() or None
         first_seen = float(first_seen_at or now)
+        requested_state = str(state or "NEW").strip() or "NEW"
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT first_seen_at, activation_seen_at
+                SELECT first_seen_at, activation_seen_at, state, manual_session_id
                 FROM message_jobs
                 WHERE msg_svr_id=?
                 LIMIT 1
@@ -2670,14 +3178,28 @@ class StateDB:
                 (msg_svr_id,),
             ).fetchone()
             preserved_first_seen = float(row["first_seen_at"]) if row is not None else first_seen
-            activation_seen = max(float(row["activation_seen_at"] or 0.0), first_seen) if row is not None else first_seen
+            if activation_seen_at is None:
+                activation_seen = max(float(row["activation_seen_at"] or 0.0), first_seen) if row is not None else first_seen
+            else:
+                activation_seen = max(float(row["activation_seen_at"] or 0.0), float(activation_seen_at)) if row is not None else float(activation_seen_at)
+            existing_state = str(row["state"] or "").strip() if row is not None else ""
+            session_value = str(manual_session_id or "").strip() or None
+            if is_message_job_terminal_state(existing_state):
+                effective_state = existing_state
+            elif existing_state == SESSION_PENDING_OPEN_STATE and requested_state != SESSION_PENDING_OPEN_STATE:
+                effective_state = requested_state
+            elif requested_state == SESSION_PENDING_OPEN_STATE and existing_state:
+                effective_state = existing_state
+            else:
+                effective_state = requested_state
+            effective_manual_session_id = session_value or (str(row["manual_session_id"] or "").strip() if row is not None else "")
             self._conn.execute(
                 """
                 INSERT INTO message_jobs(
                     msg_svr_id, talker, talker_display, thumb_path, expected_image_path,
-                    create_time, state, first_seen_at, activation_seen_at, last_seen_at, next_ui_attempt_at
+                    create_time, state, first_seen_at, activation_seen_at, last_seen_at, next_ui_attempt_at, manual_session_id
                 )
-                VALUES(?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, 0)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 ON CONFLICT(msg_svr_id) DO UPDATE SET
                     talker=excluded.talker,
                     talker_display=COALESCE(NULLIF(excluded.talker_display, ''), message_jobs.talker_display),
@@ -2692,6 +3214,16 @@ class StateDB:
                             THEN excluded.activation_seen_at
                         ELSE COALESCE(message_jobs.activation_seen_at, 0)
                     END,
+                    state=CASE
+                        WHEN message_jobs.state IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION')
+                            THEN message_jobs.state
+                        WHEN message_jobs.state = ? AND excluded.state <> ?
+                            THEN excluded.state
+                        WHEN excluded.state = ? AND COALESCE(message_jobs.state, '') <> ''
+                            THEN message_jobs.state
+                        ELSE excluded.state
+                    END,
+                    manual_session_id=COALESCE(NULLIF(excluded.manual_session_id, ''), message_jobs.manual_session_id),
                     last_seen_at=excluded.last_seen_at
                 """,
                 (
@@ -2701,9 +3233,14 @@ class StateDB:
                     thumb_str,
                     expected_str,
                     float(create_time),
+                    effective_state,
                     preserved_first_seen,
                     activation_seen,
                     float(now),
+                    effective_manual_session_id,
+                    SESSION_PENDING_OPEN_STATE,
+                    SESSION_PENDING_OPEN_STATE,
+                    SESSION_PENDING_OPEN_STATE,
                 ),
             )
             self._conn.commit()
@@ -2826,20 +3363,23 @@ class StateDB:
         create_time: float,
         msg_svr_id: Optional[str],
         manual_session_started_at: Optional[float] = None,
+        manual_session_id: Optional[str] = None,
     ) -> Optional[sqlite3.Row]:
         talker_value = str(talker or "").strip()
         msg_value = str(msg_svr_id or "").strip()
         if not talker_value or create_time <= 0 or not msg_value:
             return None
         session_floor = float(manual_session_started_at or 0.0)
+        session_id_value = str(manual_session_id or "").strip()
         with self._lock:
             return self._conn.execute(
                 """
-                SELECT msg_svr_id, create_time, state, expected_image_path, thumb_path, activation_seen_at
+                SELECT msg_svr_id, create_time, state, expected_image_path, thumb_path, activation_seen_at, manual_session_id
                 FROM message_jobs
                 WHERE talker=?
                   AND msg_svr_id<>?
-                  AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION')
+                  AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION')
+                  AND (? = '' OR COALESCE(manual_session_id, '') = ?)
                   AND (? <= 0 OR COALESCE(activation_seen_at, first_seen_at, create_time, 0) >= ?)
                   AND (
                     create_time < ?
@@ -2848,7 +3388,17 @@ class StateDB:
                 ORDER BY create_time ASC, msg_svr_id ASC
                 LIMIT 1
                 """,
-                (talker_value, msg_value, session_floor, session_floor, float(create_time), float(create_time), msg_value),
+                (
+                    talker_value,
+                    msg_value,
+                    session_id_value,
+                    session_id_value,
+                    session_floor,
+                    session_floor,
+                    float(create_time),
+                    float(create_time),
+                    msg_value,
+                ),
             ).fetchone()
 
     def set_message_job_state(
@@ -2883,10 +3433,8 @@ class StateDB:
             current_state = str(row["state"] or "")
             current_note = str(row["last_ui_result"] or "").strip()
             effective_state = state
-            if current_state == "RESOLVED" and state != "RESOLVED":
-                effective_state = "RESOLVED"
-            elif current_state == "EXCEPTION" and state not in ("EXCEPTION", "RESOLVED"):
-                effective_state = "EXCEPTION"
+            if is_message_job_terminal_state(current_state) and not is_message_job_terminal_state(state):
+                effective_state = current_state
             elif current_state == "THUMB_FALLBACK" and state != "EXCEPTION":
                 effective_state = "THUMB_FALLBACK"
 
@@ -2894,7 +3442,7 @@ class StateDB:
             effective_batch = None if reset_batch else (batch_id if batch_id is not None else row["batch_id"])
             if note:
                 note_value = note[:1200]
-                if current_note.startswith("ui_") and not note_value.startswith("ui_") and effective_state in {"RESOLVED", "THUMB_FALLBACK", "EXCEPTION"}:
+                if current_note.startswith("ui_") and not note_value.startswith("ui_") and is_message_job_terminal_state(effective_state):
                     effective_note = current_note
                 else:
                     effective_note = note_value
@@ -2957,11 +3505,20 @@ class StateDB:
             touch_ui_completed=True,
         )
 
+    def mark_message_job_ignored(self, msg_svr_id: Optional[str], state: str, note: Optional[str] = None) -> None:
+        self.set_message_job_state(
+            msg_svr_id,
+            state=state,
+            note=note,
+            next_ui_attempt_at=0.0,
+            reset_batch=True,
+        )
+
     def message_job_is_terminal(self, msg_svr_id: Optional[str]) -> bool:
         row = self.get_message_job(msg_svr_id)
         if row is None:
             return False
-        return str(row["state"] or "") in {"RESOLVED", "THUMB_FALLBACK", "EXCEPTION"}
+        return is_message_job_terminal_state(row["state"])
 
     def resolve_message_job_paths(self, msg_svr_id: Optional[str], exclude_file_id: str, sha256: str = "") -> int:
         row = self.get_message_job(msg_svr_id)
@@ -3415,30 +3972,34 @@ class GoogleSheetsSink(RowSink):
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
-    def __init__(self, db: StateDB, settle_seconds: int, thumb_candidates_enabled: bool) -> None:
+    def __init__(self, db: StateDB, cfg: "Config", media_resolver: Optional[WeChatDBResolver]) -> None:
         self.db = db
-        self.settle_seconds = settle_seconds
-        self.thumb_candidates_enabled = thumb_candidates_enabled
+        self.cfg = cfg
+        self.media_resolver = media_resolver
 
     def on_created(self, event: Any) -> None:
         if event.is_directory:
             return
-        self.db.upsert_candidate(
+        file_id = self.db.upsert_candidate(
             Path(event.src_path),
-            self.settle_seconds,
+            self.cfg.settle_seconds,
             "created",
-            thumb_candidates_enabled=self.thumb_candidates_enabled,
+            thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
         )
+        if file_id is not None:
+            preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, Path(event.src_path), "created")
 
     def on_modified(self, event: Any) -> None:
         if event.is_directory:
             return
-        self.db.upsert_candidate(
+        file_id = self.db.upsert_candidate(
             Path(event.src_path),
-            self.settle_seconds,
+            self.cfg.settle_seconds,
             "modified",
-            thumb_candidates_enabled=self.thumb_candidates_enabled,
+            thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
         )
+        if file_id is not None:
+            preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, Path(event.src_path), "modified")
 
 
 @dataclass
@@ -3465,6 +4026,9 @@ class Config:
     original_wait_seconds: int
     temp_correlation_seconds: int
     thumb_candidates_enabled: bool
+    manual_order_guard_enabled: bool
+    manual_burst_gap_seconds: int
+    manual_burst_max_seconds: int
     ui_force_download_enabled: bool
     ui_force_delay_seconds: int
     ui_force_scope: str
@@ -3514,6 +4078,175 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
     return count
 
 
+def resolve_message_context_for_candidate(
+    db: StateDB,
+    media_resolver: Optional[WeChatDBResolver],
+    cfg: Config,
+    path: Path,
+    source_kind: str,
+    mtime: float,
+) -> tuple[Optional[WeChatMessageRef], Path, Optional[Path]]:
+    if media_resolver is None:
+        return None, path, None
+
+    if source_kind == "temp_image":
+        context_path_str = db.find_recent_msgattach_context_path(
+            mtime,
+            lookback_sec=cfg.temp_correlation_seconds,
+            lookahead_sec=15,
+            limit=48,
+        )
+        if context_path_str is None:
+            context_path_str = db.find_recent_unresolved_msgattach_context_path(
+                max_age_sec=max(cfg.original_wait_seconds * 4, 1800),
+                limit=60,
+            )
+        if context_path_str is None:
+            return None, path, None
+        client_source_path = Path(context_path_str)
+        group_hash = extract_group_id_from_path(client_source_path)
+        context_row = db.get_latest_file_row_by_path(client_source_path)
+        context_mtime = float(context_row["mtime"]) if context_row is not None else mtime
+        msg_ref = media_resolver.find_message_for_path(client_source_path, context_mtime)
+        if msg_ref is None and group_hash:
+            msg_ref = media_resolver.find_unique_message_for_group(
+                group_hash,
+                context_mtime,
+                max(cfg.original_wait_seconds * 4, 1800),
+            )
+        resolved_client_source = msg_ref.preferred_context_path() if msg_ref is not None else None
+        return msg_ref, resolved_client_source or client_source_path, msg_ref.thumb_abs_path if msg_ref is not None else None
+
+    msg_ref = media_resolver.find_message_for_path(path, mtime)
+    preferred_context = msg_ref.preferred_context_path() if msg_ref is not None else None
+    thumb_path = path if source_kind == "msgattach_thumb_dat" else msg_ref.thumb_abs_path if msg_ref is not None else None
+    return msg_ref, preferred_context or path, thumb_path
+
+
+def preregister_manual_order_candidate(
+    db: StateDB,
+    media_resolver: Optional[WeChatDBResolver],
+    cfg: Config,
+    file_id: Optional[str],
+    path: Path,
+    source_event: str,
+) -> None:
+    if not cfg.manual_order_guard_enabled:
+        return
+    source_kind = detect_source_kind(path)
+    if not should_refresh_manual_session(source_kind, source_event):
+        return
+    if media_resolver is None:
+        return
+
+    file_row = db.get_file(file_id)
+    if file_row is None:
+        return
+
+    msg_ref, client_source_path, thumb_path = resolve_message_context_for_candidate(
+        db=db,
+        media_resolver=media_resolver,
+        cfg=cfg,
+        path=path,
+        source_kind=source_kind,
+        mtime=float(file_row["mtime"] or 0.0),
+    )
+    if msg_ref is None or not msg_ref.msg_svr_id or not msg_ref.talker:
+        return
+
+    existing_job = db.get_message_job(msg_ref.msg_svr_id)
+    preferred_session_id = str(existing_job["manual_session_id"] or "").strip() if existing_job is not None else None
+    session_row = db.start_or_extend_manual_order_session(
+        talker=msg_ref.talker,
+        create_time=float(msg_ref.create_time or 0.0),
+        event_ts=time.time(),
+        burst_gap_seconds=cfg.manual_burst_gap_seconds,
+        burst_max_seconds=cfg.manual_burst_max_seconds,
+        preferred_session_id=preferred_session_id,
+    )
+    if session_row is None:
+        return
+
+    expected_image_path = msg_ref.image_abs_path or expected_full_image_from_thumb_path(thumb_path or client_source_path)
+    talker_display = media_resolver.resolve_talker_display_name(msg_ref.talker) if media_resolver is not None else msg_ref.talker
+    db.ensure_message_job(
+        msg_svr_id=msg_ref.msg_svr_id,
+        talker=msg_ref.talker,
+        talker_display=talker_display or msg_ref.talker,
+        thumb_path=thumb_path,
+        expected_image_path=expected_image_path,
+        create_time=msg_ref.create_time,
+        first_seen_at=float(file_row["first_seen"] or time.time()),
+        manual_session_id=str(session_row["session_id"]),
+        state="NEW",
+        activation_seen_at=float(file_row["first_seen"] or time.time()),
+    )
+    db.update_file_message_context(
+        file_id,
+        msg_svr_id=msg_ref.msg_svr_id,
+        talker=msg_ref.talker,
+        msg_create_time=float(msg_ref.create_time or 0.0),
+        manual_session_id=str(session_row["session_id"]),
+        session_release_at=float(session_row["release_at"] or 0.0),
+    )
+    db.set_msg_cursor(msg_ref.create_time, msg_ref.msg_svr_id)
+
+
+def seed_ready_manual_session_placeholders(
+    db: StateDB,
+    media_resolver: Optional[WeChatDBResolver],
+    cfg: Config,
+) -> int:
+    if not cfg.manual_order_guard_enabled or media_resolver is None:
+        return 0
+
+    seeded = 0
+    for session in db.list_manual_sessions_ready_for_seed():
+        session_id = str(session["session_id"] or "").strip()
+        talker = str(session["talker"] or "").strip()
+        min_create_time = float(session["min_create_time"] or 0.0)
+        max_create_time = float(session["max_create_time"] or 0.0)
+        if not session_id or not talker or min_create_time <= 0 or max_create_time <= 0 or max_create_time < min_create_time:
+            db.mark_manual_session_seeded(session_id)
+            continue
+
+        for msg_ref in media_resolver.list_image_messages_for_talker(talker, min_create_time, max_create_time):
+            if msg_ref.msg_svr_id is None or not msg_ref.talker:
+                continue
+            expected_image_path = msg_ref.image_abs_path or expected_full_image_from_thumb_path(msg_ref.thumb_abs_path or Path(""))
+            existing_job = db.get_message_job(msg_ref.msg_svr_id)
+            if existing_job is None:
+                talker_display = media_resolver.resolve_talker_display_name(msg_ref.talker) if media_resolver is not None else msg_ref.talker
+                db.ensure_message_job(
+                    msg_svr_id=msg_ref.msg_svr_id,
+                    talker=msg_ref.talker,
+                    talker_display=talker_display or msg_ref.talker,
+                    thumb_path=msg_ref.thumb_abs_path,
+                    expected_image_path=expected_image_path,
+                    create_time=msg_ref.create_time,
+                    first_seen_at=float(session["started_at"] or time.time()),
+                    manual_session_id=session_id,
+                    state=SESSION_PENDING_OPEN_STATE,
+                    activation_seen_at=0.0,
+                )
+                seeded += 1
+            elif not str(existing_job["manual_session_id"] or "").strip():
+                db.ensure_message_job(
+                    msg_svr_id=msg_ref.msg_svr_id,
+                    talker=msg_ref.talker,
+                    talker_display=str(existing_job["talker_display"] or "").strip() or msg_ref.talker,
+                    thumb_path=msg_ref.thumb_abs_path,
+                    expected_image_path=expected_image_path,
+                    create_time=msg_ref.create_time,
+                    first_seen_at=float(existing_job["first_seen_at"] or session["started_at"] or time.time()),
+                    manual_session_id=session_id,
+                    state=str(existing_job["state"] or "NEW"),
+                    activation_seen_at=float(existing_job["activation_seen_at"] or 0.0),
+                )
+        db.mark_manual_session_seeded(session_id)
+    return seeded
+
+
 def ensure_message_job_tracking(
     db: StateDB,
     resolver: ClientResolver,
@@ -3523,6 +4256,7 @@ def ensure_message_job_tracking(
     thumb_path: Optional[Path],
     client_source_path: Path,
     first_seen_at: float,
+    manual_session_id: Optional[str] = None,
 ) -> Optional[sqlite3.Row]:
     if msg_ref is None or not msg_ref.msg_svr_id or not msg_ref.talker:
         return None
@@ -3542,17 +4276,25 @@ def ensure_message_job_tracking(
         expected_image_path=expected_image_path,
         create_time=msg_ref.create_time,
         first_seen_at=first_seen_at,
+        manual_session_id=manual_session_id,
     )
     db.set_msg_cursor(msg_ref.create_time, msg_ref.msg_svr_id)
     return db.get_message_job(msg_ref.msg_svr_id)
 
 
 class UIForceDownloadWorker(threading.Thread):
-    def __init__(self, db: StateDB, cfg: Config, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        db: StateDB,
+        cfg: Config,
+        stop_event: threading.Event,
+        media_resolver: Optional[WeChatDBResolver] = None,
+    ) -> None:
         super().__init__(name="wechat-ui-force-download", daemon=True)
         self.db = db
         self.cfg = cfg
         self.stop_event = stop_event
+        self.media_resolver = media_resolver
         self.available = UI_FORCE_DOWNLOADER_AVAILABLE and WeChatUIForceDownloader is not None
         self.unavailable_reason = None if self.available else (UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable")
         self._downloader = (
@@ -3633,19 +4375,23 @@ class UIForceDownloadWorker(threading.Thread):
                         resolved_path_str = getattr(result, "resolved_media_paths", {}).get(candidate.msg_svr_id)
                         resolved_path = Path(resolved_path_str) if resolved_path_str else candidate.expected_image_path
                         if resolved_path.exists():
-                            self.db.upsert_candidate(
+                            file_id = self.db.upsert_candidate(
                                 resolved_path,
                                 settle_seconds=1,
                                 source_event="ui-force",
                                 thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
                             )
+                            if file_id is not None:
+                                preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, resolved_path, "ui-force")
                         elif candidate.expected_image_path.exists():
-                            self.db.upsert_candidate(
+                            file_id = self.db.upsert_candidate(
                                 candidate.expected_image_path,
                                 settle_seconds=1,
                                 source_event="ui-force",
                                 thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
                             )
+                            if file_id is not None:
+                                preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, candidate.expected_image_path, "ui-force")
             except Exception as exc:
                 note = f"ui_worker_failed:{type(exc).__name__}:{exc}"
                 self.db.set_meta("last_ui_result", note)
@@ -3671,6 +4417,7 @@ def get_prior_message_order_blocker(
     db: StateDB,
     msg_ref: Optional[WeChatMessageRef],
     manual_session_started_at: Optional[float] = None,
+    manual_session_id: Optional[str] = None,
 ) -> Optional[sqlite3.Row]:
     if msg_ref is None:
         return None
@@ -3679,6 +4426,7 @@ def get_prior_message_order_blocker(
         create_time=float(msg_ref.create_time or 0.0),
         msg_svr_id=msg_ref.msg_svr_id,
         manual_session_started_at=manual_session_started_at,
+        manual_session_id=manual_session_id,
     )
 
 
@@ -3697,6 +4445,7 @@ def resolve_media_candidate(
     ui_force_runtime_enabled = db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)
     manual_materialization_mode = not ui_force_runtime_enabled
     manual_session_started_at = db.get_manual_session_started_at() if manual_materialization_mode else None
+    manual_session_id = item.manual_session_id
 
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
@@ -3742,12 +4491,18 @@ def resolve_media_candidate(
             thumb_path=msg_ref.thumb_abs_path if msg_ref is not None else None,
             client_source_path=resolved_client_source or client_source_path,
             first_seen_at=item.first_seen,
+            manual_session_id=manual_session_id,
         )
-        order_blocker = get_prior_message_order_blocker(db, msg_ref, manual_session_started_at=manual_session_started_at)
+        order_blocker = get_prior_message_order_blocker(
+            db,
+            msg_ref,
+            manual_session_started_at=manual_session_started_at,
+            manual_session_id=manual_session_id,
+        )
         if order_blocker is not None:
             blocker_id = str(order_blocker["msg_svr_id"])
-            db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
-            print(f"[HOLD] {original_path.name} | waiting_prior_message_order | blocker={blocker_id}")
+            db.mark_hold(item.file_id, reason=f"WAITING_SESSION_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
+            print(f"[HOLD] {original_path.name} | waiting_session_prior_message_order | blocker={blocker_id}")
             return None
         if tracked_job is not None and msg_ref is not None and msg_ref.image_abs_path is not None and msg_ref.image_abs_path.exists():
             return MediaResolution(
@@ -3799,12 +4554,18 @@ def resolve_media_candidate(
         thumb_path=original_path if original_source_kind == "msgattach_thumb_dat" else msg_ref.thumb_abs_path if msg_ref is not None else None,
         client_source_path=client_source_path,
         first_seen_at=item.first_seen,
+        manual_session_id=manual_session_id,
     )
-    order_blocker = get_prior_message_order_blocker(db, msg_ref, manual_session_started_at=manual_session_started_at)
+    order_blocker = get_prior_message_order_blocker(
+        db,
+        msg_ref,
+        manual_session_started_at=manual_session_started_at,
+        manual_session_id=manual_session_id,
+    )
     if order_blocker is not None:
         blocker_id = str(order_blocker["msg_svr_id"])
-        db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
-        print(f"[HOLD] {original_path.name} | waiting_prior_message_order | blocker={blocker_id}")
+        db.mark_hold(item.file_id, reason=f"WAITING_SESSION_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
+        print(f"[HOLD] {original_path.name} | waiting_session_prior_message_order | blocker={blocker_id}")
         return None
 
     if original_source_kind == "msgattach_thumb_dat":
@@ -4071,6 +4832,7 @@ def process_item(
             "msg_svr_id": msg_svr_id,
             "talker": resolution.msg_ref.talker if resolution.msg_ref is not None else None,
             "msg_create_time": resolution.msg_ref.create_time if resolution.msg_ref is not None else None,
+            "manual_session_id": item.manual_session_id,
             "resolved_media_path": str(path),
             "resolution_source": resolution.resolution_source,
             "verification_status": resolution.verification_status,
@@ -4130,15 +4892,26 @@ def process_item(
         print(f"[RETRY] {path.name} | attempt={item.attempts} | err={type(exc).__name__}: {exc}")
 
 
-def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int = 50) -> int:
+def flush_ready_sink_rows(
+    db: StateDB,
+    sink: RowSink,
+    cfg: Config,
+    media_resolver: Optional[WeChatDBResolver] = None,
+    max_rows: int = 50,
+) -> int:
     committed = 0
     limit = max(1, int(max_rows))
+    seeded_placeholders = seed_ready_manual_session_placeholders(db, media_resolver, cfg)
+    if seeded_placeholders:
+        print(f"[SESSION] seeded_placeholders={seeded_placeholders}")
     manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None
+    manual_session_id = db.get_current_manual_session_id() if is_manual_materialization_mode(db, cfg) else None
     for _ in range(limit):
         claimed = db.claim_next_sink_receipt(
             sheet_order_scope=cfg.sheet_order_scope,
             commit_order=cfg.sheet_commit_order,
             manual_session_started_at=manual_session_started_at,
+            manual_session_id=manual_session_id,
         )
         if claimed is None:
             break
@@ -4403,6 +5176,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--original-wait-seconds", type=int, default=int(os.getenv("WECHAT_ORIGINAL_WAIT_SECONDS", "90")))
     p.add_argument("--temp-correlation-seconds", type=int, default=int(os.getenv("WECHAT_TEMP_CORRELATION_SECONDS", "30")))
     p.add_argument("--thumb-candidates-enabled", default=os.getenv("WECHAT_THUMB_CANDIDATES_ENABLED", "false"))
+    p.add_argument("--manual-order-guard-enabled", default=os.getenv("WECHAT_MANUAL_ORDER_GUARD_ENABLED", "true"))
+    p.add_argument("--manual-burst-gap-seconds", type=int, default=int(os.getenv("WECHAT_MANUAL_BURST_GAP_SECONDS", "2")))
+    p.add_argument("--manual-burst-max-seconds", type=int, default=int(os.getenv("WECHAT_MANUAL_BURST_MAX_SECONDS", "8")))
     p.add_argument("--ui-force-download-enabled", default=os.getenv("WECHAT_UI_FORCE_DOWNLOAD_ENABLED", "false"))
     p.add_argument("--ui-force-delay-seconds", type=int, default=int(os.getenv("WECHAT_UI_FORCE_DELAY_SECONDS", "15")))
     p.add_argument("--ui-force-scope", default=os.getenv("WECHAT_UI_FORCE_SCOPE", "mapped-groups"))
@@ -4444,6 +5220,9 @@ def build_config(args: argparse.Namespace) -> Config:
         original_wait_seconds=max(30, int(args.original_wait_seconds)),
         temp_correlation_seconds=max(5, int(args.temp_correlation_seconds)),
         thumb_candidates_enabled=parse_boolish(args.thumb_candidates_enabled, default=False),
+        manual_order_guard_enabled=parse_boolish(args.manual_order_guard_enabled, default=True),
+        manual_burst_gap_seconds=max(1, int(args.manual_burst_gap_seconds)),
+        manual_burst_max_seconds=max(max(1, int(args.manual_burst_gap_seconds)), int(args.manual_burst_max_seconds)),
         ui_force_download_enabled=parse_boolish(args.ui_force_download_enabled, default=False),
         ui_force_delay_seconds=max(5, int(args.ui_force_delay_seconds)),
         ui_force_scope=(str(args.ui_force_scope).strip().lower() or "mapped-groups"),
@@ -4512,6 +5291,9 @@ def main() -> int:
     print(f"Original wait (seconds): {cfg.original_wait_seconds}")
     print(f"Temp correlation (seconds): {cfg.temp_correlation_seconds}")
     print(f"Thumb candidates enabled: {cfg.thumb_candidates_enabled}")
+    print(f"Manual order guard: {cfg.manual_order_guard_enabled}")
+    print(f"Manual burst gap (seconds): {cfg.manual_burst_gap_seconds}")
+    print(f"Manual burst max (seconds): {cfg.manual_burst_max_seconds}")
     print(f"Verification column: {cfg.verification_column_name}")
     print(f"UI force download: {cfg.ui_force_download_enabled}")
     print(f"UI force delay (seconds): {cfg.ui_force_delay_seconds}")
@@ -4562,6 +5344,15 @@ def main() -> int:
         ignored_manual_open_only = db.ignore_manual_open_only_waits()
         if ignored_manual_open_only:
             print(f"[RECOVER] ignored_manual_open_only_waits={ignored_manual_open_only}")
+    if cfg.manual_order_guard_enabled:
+        stale_placeholders, stale_released = db.ignore_stale_manual_sessions(
+            max_age_sec=max(1800, cfg.original_wait_seconds * 8),
+        )
+        if stale_placeholders or stale_released:
+            print(
+                f"[RECOVER] stale_manual_sessions_placeholders={stale_placeholders} "
+                f"| released_files={stale_released}"
+            )
     ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
     if ignored_old:
         print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
@@ -4612,7 +5403,7 @@ def main() -> int:
     observer: Optional[Observer] = None
     if WATCHDOG_AVAILABLE and not cfg.disable_watchdog:
         observer = Observer()
-        handler = IngestEventHandler(db, cfg.settle_seconds, cfg.thumb_candidates_enabled)
+        handler = IngestEventHandler(db, cfg, media_resolver)
         for root in cfg.watch_roots:
             if root.exists():
                 observer.schedule(handler, str(root), recursive=True)
@@ -4624,7 +5415,7 @@ def main() -> int:
     stop_event = threading.Event()
     ui_worker: Optional[UIForceDownloadWorker] = None
     if cfg.ui_force_download_enabled and cfg.resolution_mode == "db-first":
-        ui_worker = UIForceDownloadWorker(db=db, cfg=cfg, stop_event=stop_event)
+        ui_worker = UIForceDownloadWorker(db=db, cfg=cfg, stop_event=stop_event, media_resolver=media_resolver)
         if ui_worker.available:
             ui_worker.start()
             print("UI force download worker: enabled")
@@ -4642,11 +5433,16 @@ def main() -> int:
                 last_reconcile = now
                 print(f"[SCAN] reconcile complete | queued_or_refreshed={added}")
 
-            flush_ready_sink_rows(db, sink, cfg, max_rows=50)
+            flush_ready_sink_rows(db, sink, cfg, media_resolver=media_resolver, max_rows=50)
             manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None
-            item = db.claim_next(manual_session_started_at=manual_session_started_at)
+            manual_session_id = db.get_current_manual_session_id() if is_manual_materialization_mode(db, cfg) else None
+            seed_ready_manual_session_placeholders(db, media_resolver, cfg)
+            item = db.claim_next(
+                manual_session_started_at=manual_session_started_at,
+                manual_session_id=manual_session_id,
+            )
             if item is None:
-                flush_ready_sink_rows(db, sink, cfg, max_rows=50)
+                flush_ready_sink_rows(db, sink, cfg, media_resolver=media_resolver, max_rows=50)
                 time.sleep(cfg.idle_sleep_seconds)
                 continue
             process_item(
@@ -4658,7 +5454,7 @@ def main() -> int:
                 media_resolver=media_resolver,
                 cfg=cfg,
             )
-            flush_ready_sink_rows(db, sink, cfg, max_rows=50)
+            flush_ready_sink_rows(db, sink, cfg, media_resolver=media_resolver, max_rows=50)
     except KeyboardInterrupt:
         print("Stopping daemon...")
     finally:
