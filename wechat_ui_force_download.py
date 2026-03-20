@@ -13,6 +13,8 @@ from pywinauto.keyboard import send_keys
 
 
 MAIN_WINDOW_CLASS = "WeChatMainWndForPC"
+MAIN_WINDOW_RETRY_ATTEMPTS = 3
+MAIN_WINDOW_RETRY_DELAY_SECONDS = 1.5
 CLASSIC_VIEWER_CLASSES = {"WeChatAppEx", "Chrome_WidgetWin_0"}
 HOVER_WINDOW_CLASSES = {"HttpImgHoverWnd", "Search2Wnd"}
 CONVERSATION_PARENT_MARKERS = {"会话", "conversation"}
@@ -47,6 +49,13 @@ class UIForceBatchResult:
     resolved_media_paths: dict[str, str] = field(default_factory=dict)
     resolved_sources: dict[str, str] = field(default_factory=dict)
     note: str = ""
+
+
+@dataclass
+class MainWindowProbeResult:
+    window: Optional[Any]
+    ready: bool
+    note: str
 
 
 def normalize_ui_text(value: Any) -> str:
@@ -134,6 +143,41 @@ class WeChatUIForceDownloader:
         except Exception:
             return False
 
+    def _window_area(self, wrapper: Any) -> int:
+        rect = self._safe_rectangle(wrapper)
+        if rect is None:
+            return 0
+        try:
+            return max(0, int(rect.width())) * max(0, int(rect.height()))
+        except Exception:
+            return 0
+
+    def _compact_text(self, value: Any, limit: int = 48) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip().replace("|", "/")
+        if not text:
+            return "?"
+        return text[:limit]
+
+    def _describe_wrapper(self, wrapper: Any) -> str:
+        cls_name = self._compact_text(self._safe_class_name(wrapper), limit=32)
+        title = self._compact_text(self._safe_window_text(wrapper), limit=48)
+        visible = "1" if self._is_visible(wrapper) else "0"
+        return f"{cls_name}:{title}:vis={visible}"
+
+    def _summarize_candidates(self, windows: list[Any], limit: int = 2) -> str:
+        if not windows:
+            return "none"
+        ordered = sorted(windows, key=self._window_area, reverse=True)
+        return ",".join(self._describe_wrapper(win) for win in ordered[: max(1, limit)])
+
+    def _restore_window(self, wrapper: Any) -> bool:
+        try:
+            wrapper.restore()
+            time.sleep(0.25)
+        except Exception:
+            return self._is_visible(wrapper)
+        return self._is_visible(wrapper)
+
     def _focus_wrapper(self, wrapper: Any) -> None:
         try:
             wrapper.set_focus()
@@ -145,29 +189,88 @@ class WeChatUIForceDownloader:
         except Exception:
             pass
 
-    def _main_window(self) -> Any:
+    def _probe_main_window_once(self) -> MainWindowProbeResult:
         windows = []
+        lookup_note: Optional[str] = None
         try:
             windows = self.desktop.windows(class_name=MAIN_WINDOW_CLASS, visible_only=False)
-        except Exception:
+        except Exception as exc:
             windows = []
-        visible: list[Any] = []
-        for win in windows:
-            rect = self._safe_rectangle(win)
-            if rect is None:
-                continue
-            if self._is_visible(win):
-                visible.append(win)
+            lookup_note = f"class_lookup_err={type(exc).__name__}:{self._compact_text(exc, limit=72)}"
+        ordered = sorted(windows, key=self._window_area, reverse=True)
+        visible = [win for win in ordered if self._is_visible(win)]
+        sample = self._summarize_candidates(ordered)
         if visible:
-            visible.sort(key=lambda win: self._safe_rectangle(win).width() * self._safe_rectangle(win).height(), reverse=True)
-            return visible[0]
-        if windows:
-            return windows[0]
+            return MainWindowProbeResult(
+                window=visible[0],
+                ready=True,
+                note=f"source=class_visible|class_count={len(windows)}|sample={sample}",
+            )
+        if ordered:
+            restored = self._restore_window(ordered[0])
+            return MainWindowProbeResult(
+                window=ordered[0],
+                ready=restored or self._is_visible(ordered[0]),
+                note=(
+                    f"source=class_hidden|class_count={len(windows)}|restore={'ok' if restored else 'no'}"
+                    f"|sample={sample}"
+                ),
+            )
         try:
             app = Application(backend="uia").connect(path="WeChat.exe")
-            return app.top_window()
+            win = app.top_window()
+            if win is None:
+                note_parts = [f"class_count={len(windows)}", f"sample={sample}", "fallback=top_window_none"]
+                if lookup_note:
+                    note_parts.insert(0, lookup_note)
+                return MainWindowProbeResult(window=None, ready=False, note="|".join(note_parts))
+            restored = self._restore_window(win)
+            return MainWindowProbeResult(
+                window=win,
+                ready=restored or self._is_visible(win),
+                note=(
+                    f"source=process_connect|class_count={len(windows)}|restore={'ok' if restored else 'no'}"
+                    f"|fallback={self._describe_wrapper(win)}"
+                ),
+            )
         except Exception as exc:
-            raise RuntimeError("wechat_main_window_not_found") from exc
+            note_parts = [f"class_count={len(windows)}", f"sample={sample}"]
+            if lookup_note:
+                note_parts.insert(0, lookup_note)
+            note_parts.append(f"fallback_err={type(exc).__name__}:{self._compact_text(exc, limit=72)}")
+            return MainWindowProbeResult(window=None, ready=False, note="|".join(note_parts))
+
+    def _probe_main_window(
+        self,
+        retries: int = MAIN_WINDOW_RETRY_ATTEMPTS,
+        retry_delay: float = MAIN_WINDOW_RETRY_DELAY_SECONDS,
+    ) -> MainWindowProbeResult:
+        attempts = max(1, int(retries))
+        delay_seconds = max(0.1, float(retry_delay))
+        last_result = MainWindowProbeResult(window=None, ready=False, note="main_window_probe_not_started")
+        for attempt in range(1, attempts + 1):
+            result = self._probe_main_window_once()
+            result.note = f"attempt={attempt}/{attempts}|{result.note}"
+            if result.window is not None:
+                return result
+            last_result = result
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+        return last_result
+
+    def probe_main_window(
+        self,
+        retries: int = MAIN_WINDOW_RETRY_ATTEMPTS,
+        retry_delay: float = MAIN_WINDOW_RETRY_DELAY_SECONDS,
+    ) -> tuple[bool, str]:
+        result = self._probe_main_window(retries=retries, retry_delay=retry_delay)
+        return bool(result.ready), result.note
+
+    def _main_window(self) -> Any:
+        result = self._probe_main_window()
+        if result.window is not None:
+            return result.window
+        raise RuntimeError(f"wechat_main_window_not_found|{result.note}")
 
     def _focus_main_window(self, win: Any) -> None:
         try:

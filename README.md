@@ -62,6 +62,16 @@ Status:
 powershell -ExecutionPolicy Bypass -File .\STATUS_WECHAT_OCR.ps1
 ```
 
+Painel visual:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ABRIR_PAINEL_WECHAT_OCR.ps1
+```
+
+Ou com duplo clique:
+```bat
+.\ABRIR_PAINEL_WECHAT_OCR.cmd
+```
+
 Ao vivo:
 ```bat
 .\STATUS_WECHAT_OCR_AO_VIVO.cmd

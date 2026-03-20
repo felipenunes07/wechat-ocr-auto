@@ -1759,6 +1759,34 @@ class StateDB:
                 (str(expected_image_path),),
             ).fetchone()
 
+    def find_prior_pending_message_job(
+        self,
+        talker: Optional[str],
+        create_time: float,
+        msg_svr_id: Optional[str],
+    ) -> Optional[sqlite3.Row]:
+        talker_value = str(talker or "").strip()
+        msg_value = str(msg_svr_id or "").strip()
+        if not talker_value or create_time <= 0 or not msg_value:
+            return None
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT msg_svr_id, create_time, state, expected_image_path, thumb_path
+                FROM message_jobs
+                WHERE talker=?
+                  AND msg_svr_id<>?
+                  AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION')
+                  AND (
+                    create_time < ?
+                    OR (create_time = ? AND msg_svr_id < ?)
+                  )
+                ORDER BY create_time ASC, msg_svr_id ASC
+                LIMIT 1
+                """,
+                (talker_value, msg_value, float(create_time), float(create_time), msg_value),
+            ).fetchone()
+
     def set_message_job_state(
         self,
         msg_svr_id: Optional[str],
@@ -2499,6 +2527,19 @@ def has_core_signal(fields: dict[str, Any], bank: Optional[str]) -> bool:
     )
 
 
+def get_prior_message_order_blocker(
+    db: StateDB,
+    msg_ref: Optional[WeChatMessageRef],
+) -> Optional[sqlite3.Row]:
+    if msg_ref is None:
+        return None
+    return db.find_prior_pending_message_job(
+        talker=msg_ref.talker,
+        create_time=float(msg_ref.create_time or 0.0),
+        msg_svr_id=msg_ref.msg_svr_id,
+    )
+
+
 def resolve_media_candidate(
     item: QueueItem,
     db: StateDB,
@@ -2557,6 +2598,12 @@ def resolve_media_candidate(
             client_source_path=resolved_client_source or client_source_path,
             first_seen_at=item.first_seen,
         )
+        order_blocker = get_prior_message_order_blocker(db, msg_ref)
+        if order_blocker is not None:
+            blocker_id = str(order_blocker["msg_svr_id"])
+            db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
+            print(f"[HOLD] {original_path.name} | waiting_prior_message_order | blocker={blocker_id}")
+            return None
         if tracked_job is not None and msg_ref is not None and msg_ref.image_abs_path is not None and msg_ref.image_abs_path.exists():
             return MediaResolution(
                 original_source_path=original_path,
@@ -2595,6 +2642,12 @@ def resolve_media_candidate(
         client_source_path=client_source_path,
         first_seen_at=item.first_seen,
     )
+    order_blocker = get_prior_message_order_blocker(db, msg_ref)
+    if order_blocker is not None:
+        blocker_id = str(order_blocker["msg_svr_id"])
+        db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
+        print(f"[HOLD] {original_path.name} | waiting_prior_message_order | blocker={blocker_id}")
+        return None
 
     if original_source_kind == "msgattach_thumb_dat":
         if msg_ref is not None and msg_ref.image_abs_path is not None and msg_ref.image_abs_path.exists():
@@ -2651,20 +2704,25 @@ def resolve_media_candidate(
             print(f"[HOLD] {original_path.name} | waiting_original_media")
             return None
 
-        if tracked_job is not None:
-            db.mark_message_job_thumb_fallback(msg_ref.msg_svr_id if msg_ref is not None else None, note="THUMB_FALLBACK")
-        print(f"[FALLBACK] {original_path.name} | processing_thumb_directly")
-        return MediaResolution(
-            original_source_path=original_path,
-            original_source_kind=original_source_kind,
-            resolved_path=original_path,
-            resolved_source_kind=original_source_kind,
-            client_source_path=client_source_path,
-            resolution_source="thumb_fallback",
-            verification_status="THUMB_FALLBACK",
-            msg_ref=msg_ref,
-            using_thumb_fallback=True,
-        )
+        if tracked_job is not None and cfg.ui_force_download_enabled and tracked_state != "UI_FORCE_RUNNING":
+            db.set_message_job_state(
+                msg_ref.msg_svr_id if msg_ref is not None else None,
+                "UI_FORCE_PENDING",
+                note="WAITING_ORIGINAL_MEDIA",
+                next_ui_attempt_at=0.0,
+                reset_batch=True,
+            )
+        elif tracked_job is not None:
+            db.set_message_job_state(
+                msg_ref.msg_svr_id if msg_ref is not None else None,
+                "WAITING_ORIGINAL",
+                note="WAITING_ORIGINAL_MEDIA",
+                next_ui_attempt_at=0.0,
+                reset_batch=True,
+            )
+        db.mark_hold(item.file_id, reason="WAITING_ORIGINAL_MEDIA", delay_sec=15)
+        print(f"[HOLD] {original_path.name} | waiting_original_media_no_thumb_fallback")
+        return None
 
     resolved_path = original_path
     resolved_source_kind = original_source_kind
@@ -2835,6 +2893,10 @@ def process_item(
         if isinstance(exc, FileNotFoundError) and item.source_kind == "temp_image" and db.message_job_is_terminal(msg_svr_id):
             db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="RESOLVED_BY_LATER_SUCCESS")
             print(f"[SKIP] {path.name} | temp_missing_after_resolution")
+            return
+        if isinstance(exc, FileNotFoundError) and item.source_kind == "temp_image" and item.attempts >= 3:
+            db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="STALE_TEMP_ORPHAN")
+            print(f"[SKIP] {path.name} | temp_file_disappeared_after_{item.attempts}_attempts")
             return
         fast_retry = 5 if isinstance(exc, PermissionError) else None
         db.mark_retry(
@@ -3044,6 +3106,23 @@ def main() -> int:
     print(f"UI batch mode: {cfg.ui_batch_mode}")
     print(f"UI item timeout (seconds): {cfg.ui_item_timeout_seconds}")
     print(f"UI retry backoff (seconds): {cfg.ui_retry_backoff_seconds}")
+    if cfg.ui_force_download_enabled:
+        if not UI_FORCE_DOWNLOADER_AVAILABLE or WeChatUIForceDownloader is None:
+            err = UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable"
+            print(f"[WARN] UI probe failed | err={err}")
+        else:
+            try:
+                ui_probe = WeChatUIForceDownloader(
+                    focus_policy=cfg.ui_focus_policy,
+                    item_timeout_seconds=cfg.ui_item_timeout_seconds,
+                )
+                probe_ok, probe_note = ui_probe.probe_main_window()
+                if probe_ok:
+                    print("UI probe: ok")
+                else:
+                    print(f"[WARN] UI probe failed | err={probe_note}")
+            except Exception as exc:
+                print(f"[WARN] UI probe failed | err={type(exc).__name__}: {exc}")
 
     ensure_client_map_file(cfg.client_map_path, cfg.watch_roots)
     resolver = ClientResolver(cfg.client_map_path)
