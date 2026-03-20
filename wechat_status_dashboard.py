@@ -22,6 +22,7 @@ MAX_MESSAGE_ROWS = 120
 MAX_RECEIPT_ROWS = 40
 MAX_LOG_LINES = 24
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
+MANUAL_SESSION_META_KEY = "manual_session_started_at"
 SINK_CONFIG_FILE = "sink_config.json"
 
 WAITING_LABELS = {
@@ -29,6 +30,7 @@ WAITING_LABELS = {
     "WAITING_UI_FORCE_DOWNLOAD": "Baixando pelo WeChat",
     "WAITING_TEMP_CONTEXT": "Aguardando contexto temp",
     "WAITING_TEMP_DB_MATCH": "Aguardando match temp",
+    "MANUAL_WAIT_ORIGINAL": "Aguardando abrir no PC",
 }
 
 MESSAGE_STATE_LABELS = {
@@ -243,6 +245,17 @@ def set_ui_force_runtime_enabled(base_dir: Path, enabled: bool) -> tuple[bool, s
             """,
             (UI_FORCE_RUNTIME_META_KEY, "1" if enabled else "0", float(now)),
         )
+        if not enabled:
+            cur.execute(
+                """
+                INSERT INTO meta(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (MANUAL_SESSION_META_KEY, str(float(now)), float(now)),
+            )
 
         released_jobs = 0
         requeued_files = 0
@@ -386,6 +399,16 @@ def clear_queue_backlog(base_dir: Path) -> tuple[bool, str]:
                 updated_at=excluded.updated_at
             """,
             ("last_manual_queue_clear_at", str(float(cutoff)), float(cutoff)),
+        )
+        cur.execute(
+            """
+            INSERT INTO meta(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (MANUAL_SESSION_META_KEY, str(float(cutoff)), float(cutoff)),
         )
         conn.commit()
     except Exception as exc:

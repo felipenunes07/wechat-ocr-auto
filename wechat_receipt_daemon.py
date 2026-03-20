@@ -30,6 +30,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path, PureWindowsPath
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
@@ -80,6 +81,7 @@ BASE_LANC_HEADERS = [
 ]
 DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
+MANUAL_SESSION_META_KEY = "manual_session_started_at"
 
 
 def is_candidate(path: Path) -> bool:
@@ -140,6 +142,23 @@ def sheet_header_range(headers: list[str]) -> str:
 def sheet_table_range(headers: list[str]) -> str:
     last_col = chr(ord("A") + max(0, len(headers) - 1))
     return f"A:{last_col}"
+
+
+def sheet_row_range(headers: list[str], row_idx: int) -> str:
+    last_col = chr(ord("A") + max(0, len(headers) - 1))
+    row_value = max(1, int(row_idx))
+    return f"A{row_value}:{last_col}{row_value}"
+
+
+def build_sink_row_values(row_payload: dict[str, Any]) -> list[Any]:
+    return [
+        row_payload.get("client"),
+        row_payload.get("txn_date"),
+        row_payload.get("txn_time"),
+        row_payload.get("bank"),
+        row_payload.get("amount"),
+        row_payload.get("verification_status"),
+    ]
 
 
 def resolve_full_image_from_thumb_path(thumb_path: Path) -> Optional[Path]:
@@ -301,13 +320,16 @@ def build_ocr_engine() -> OCREngine:
 
 
 DATE_PATTERNS = [
-    re.compile(r"\b(\d{2}/\d{2}/\d{4})\b"),
-    re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
-    re.compile(r"\b(\d{2}-\d{2}-\d{4})\b"),
-    re.compile(r"\b(\d{2}/\d{2}/\d{2})\b"),
+    re.compile(r"(?<!\d)(\d{1,2}/\d{1,2}/\d{4})"),
+    re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})"),
+    re.compile(r"(?<!\d)(\d{1,2}-\d{1,2}-\d{4})"),
+    re.compile(r"(?<!\d)(\d{1,2}/\d{1,2}/\d{2})(?!\d)"),
 ]
-ALPHA_MONTH_DATE_PATTERN = re.compile(r"\b(\d{1,2})\s*[-/]?\s*([A-Za-z]{3})\s*[-/]?\s*(\d{4})\b", re.IGNORECASE)
-TIME_PATTERN = re.compile(r"\b(\d{2}:\d{2}(?::\d{2})?)\b")
+ALPHA_MONTH_DATE_PATTERN = re.compile(
+    r"(?<!\d)(\d{1,2})(?:\s*de\s*|\s*[\/\-.]?\s*)([a-z]{3,12})\.?(?:\s*de\s*|\s*[\/\-.]?\s*)(\d{4})(?!\d)",
+    re.IGNORECASE,
+)
+TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2}\s*(?::|h)\s*\d{2}(?:\s*(?::|h)\s*\d{2})?)(?!\d)", re.IGNORECASE)
 AMOUNT_CURRENCY_PATTERN = re.compile(
     r"(?<![A-Z0-9])(R\$|RS|US\$|USD|BRL|CNY|RMB|¥|￥|R(?=\s))\s*([0-9][0-9\.,]{0,20})",
     re.IGNORECASE,
@@ -343,25 +365,97 @@ AMOUNT_NEGATIVE_HINTS = (
 )
 MONTH_TOKEN_MAP = {
     "JAN": 1,
+    "JANEIRO": 1,
+    "ENERO": 1,
+    "JANUARY": 1,
     "FEB": 2,
     "FEV": 2,
+    "FEVEREIRO": 2,
+    "FEBRERO": 2,
+    "FEBRUARY": 2,
     "MAR": 3,
+    "MARCO": 3,
+    "MARZO": 3,
+    "MARCH": 3,
     "APR": 4,
     "ABR": 4,
+    "ABRIL": 4,
+    "APRIL": 4,
     "MAY": 5,
     "MAI": 5,
+    "MAIO": 5,
+    "MAYO": 5,
     "JUN": 6,
+    "JUNHO": 6,
+    "JUNIO": 6,
+    "JUNE": 6,
     "JUL": 7,
+    "JULHO": 7,
+    "JULIO": 7,
+    "JULY": 7,
     "AUG": 8,
     "AGO": 8,
+    "AGOSTO": 8,
+    "AUGUST": 8,
     "SEP": 9,
     "SET": 9,
+    "SETEMBRO": 9,
+    "SEPTIEMBRE": 9,
+    "SETIEMBRE": 9,
+    "SEPTEMBER": 9,
     "OCT": 10,
     "OUT": 10,
+    "OUTUBRO": 10,
+    "OCTUBRE": 10,
+    "OCTOBER": 10,
     "NOV": 11,
+    "NOVEMBRO": 11,
+    "NOVIEMBRE": 11,
+    "NOVEMBER": 11,
     "DEC": 12,
     "DEZ": 12,
+    "DEZEMBRO": 12,
+    "DICIEMBRE": 12,
+    "DECEMBER": 12,
 }
+DATE_CONTEXT_HINTS = (
+    "data",
+    "horario",
+    "hora",
+    "realizadaem",
+    "realizadoem",
+    "transferidoem",
+    "transferido",
+    "pagamento",
+    "datadopagamento",
+    "comprovante",
+    "pix",
+    "geracao",
+)
+TIME_CONTEXT_HINTS = (
+    "horario",
+    "hora",
+    "as",
+    "realizadaem",
+    "realizadoem",
+    "transferidoem",
+    "pagamento",
+    "datadopagamento",
+    "comprovante",
+    "pix",
+    "geracao",
+)
+COMPACT_AMOUNT_CONTEXT_HINTS = (
+    "comprovante",
+    "valor",
+    "pagamento",
+    "transfer",
+    "pix",
+    "realizada",
+    "realizado",
+    "transferido",
+    "transferencia",
+)
 
 BENEFICIARY_KEYS = [
     "favorecido",
@@ -442,18 +536,45 @@ def should_ignore_sender(msg_ref: Optional["WeChatMessageRef"]) -> bool:
     return sender in IGNORED_SENDER_USERNAMES or talker in IGNORED_SENDER_USERNAMES
 
 
+def strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def normalize_ocr_text_for_parsing(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = (
+        normalized.replace("，", ",")
+        .replace("。", ".")
+        .replace("：", ":")
+        .replace("；", ";")
+        .replace("／", "/")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("\u00a0", " ")
+    )
+    normalized = strip_accents(normalized).lower()
+    normalized = re.sub(r"[^\S\n]+", " ", normalized)
+    return normalized.strip()
+
+
+def today_local_date_str() -> str:
+    return datetime.now().strftime("%d/%m/%Y")
+
+
 def normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     v = value.strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
         try:
             dt = datetime.strptime(v, fmt)
             return dt.strftime("%d/%m/%Y")
         except Exception:
             continue
-    compact = re.sub(r"[^A-Za-z0-9]", "", v).upper()
-    m = re.fullmatch(r"(\d{1,2})([A-Z]{3})(\d{4})", compact)
+    compact = re.sub(r"[^A-Za-z0-9]", "", strip_accents(v)).upper()
+    m = re.fullmatch(r"(\d{1,2})([A-Z]{3,12})(\d{4})", compact)
     if m:
         token = m.group(2)
         month = MONTH_TOKEN_MAP.get(token)
@@ -463,18 +584,6 @@ def normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
                 return dt.strftime("%d/%m/%Y")
             except Exception:
                 pass
-    return value
-
-
-def extract_first_date_value(text: str) -> Optional[str]:
-    for pat in DATE_PATTERNS:
-        m = pat.search(text)
-        if m:
-            return normalize_date_for_excel(m.group(1))
-
-    m = ALPHA_MONTH_DATE_PATTERN.search(text)
-    if m:
-        return normalize_date_for_excel("".join(m.groups()))
     return None
 
 
@@ -490,7 +599,8 @@ def normalize_currency_code(value: str) -> Optional[str]:
 def normalize_time_for_excel(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
-    parts = value.strip().split(":")
+    cleaned = re.sub(r"\s+", "", str(value).strip().lower()).replace("h", ":")
+    parts = cleaned.split(":")
     if len(parts) < 2:
         return None
     try:
@@ -503,21 +613,136 @@ def normalize_time_for_excel(value: Optional[str]) -> Optional[str]:
     return f"{h:02d}:{m:02d}"
 
 
-def _count_date_matches(text: str) -> int:
-    total = 0
+def _iter_date_candidates(text: str) -> list[tuple[str, int, int]]:
+    candidates: list[tuple[str, int, int]] = []
     for pat in DATE_PATTERNS:
-        total += len(pat.findall(text))
-    for day, month_token, year in ALPHA_MONTH_DATE_PATTERN.findall(text):
-        if normalize_date_for_excel(f"{day}{month_token}{year}"):
-            total += 1
-    return total
+        for match in pat.finditer(text):
+            normalized = normalize_date_for_excel(match.group(1))
+            if normalized:
+                candidates.append((normalized, match.start(1), match.end(1)))
+
+    for match in ALPHA_MONTH_DATE_PATTERN.finditer(text):
+        token = f"{match.group(1)}{match.group(2)}{match.group(3)}"
+        normalized = normalize_date_for_excel(token)
+        if normalized:
+            candidates.append((normalized, match.start(1), match.end(3)))
+    return candidates
+
+
+def _iter_time_candidates(text: str) -> list[tuple[str, int, int]]:
+    candidates: list[tuple[str, int, int]] = []
+    for match in TIME_PATTERN.finditer(text):
+        normalized = normalize_time_for_excel(match.group(1))
+        if normalized:
+            candidates.append((normalized, match.start(1), match.end(1)))
+    return candidates
+
+
+def _pick_best_date_candidate(lines: list[str]) -> Optional[str]:
+    candidates: list[tuple[int, int, int, str]] = []
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        prev_low = lines[idx - 1] if idx > 0 else ""
+        next_low = lines[idx + 1] if idx + 1 < len(lines) else ""
+        context_low = " ".join(part for part in (prev_low, line, next_low) if part)
+        for value, start, _end in _iter_date_candidates(line):
+            score = 0
+            if any(token in context_low for token in DATE_CONTEXT_HINTS):
+                score += 12
+            if _iter_time_candidates(line):
+                score += 8
+            if idx == 0 and len(line.strip()) <= 24:
+                score -= 2
+            candidates.append((-score, idx, start, value))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][3]
+
+
+def _pick_best_time_candidate(lines: list[str]) -> Optional[str]:
+    candidates: list[tuple[int, int, int, str]] = []
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        prev_low = lines[idx - 1] if idx > 0 else ""
+        next_low = lines[idx + 1] if idx + 1 < len(lines) else ""
+        context_low = " ".join(part for part in (prev_low, line, next_low) if part)
+        stripped = line.strip()
+        line_dates = _iter_date_candidates(line)
+        for value, start, _end in _iter_time_candidates(line):
+            score = 0
+            if any(token in context_low for token in TIME_CONTEXT_HINTS):
+                score += 12
+            if line_dates:
+                score += 10
+            if idx == 0 and re.fullmatch(r"\d{1,2}(?::|h)\d{2}", stripped):
+                score -= 14
+            if len(stripped) <= 8 and re.fullmatch(r"\d{1,2}(?::|h)\d{2}", stripped):
+                score -= 8
+            candidates.append((-score, idx, start, value))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][3]
+
+
+def extract_datetime_values(text: str) -> tuple[Optional[str], Optional[str]]:
+    normalized = normalize_ocr_text_for_parsing(text)
+    date_candidates = _iter_date_candidates(normalized)
+    time_candidates = _iter_time_candidates(normalized)
+
+    paired: list[tuple[int, int, int, str, str]] = []
+    for date_value, date_start, date_end in date_candidates:
+        suffix_match = re.match(
+            r"^\s*(?:as)?\s*,?\s*(\d{1,2}\s*(?::|h)\s*\d{2}(?:\s*(?::|h)\s*\d{2})?)",
+            normalized[date_end : date_end + 24],
+        )
+        if suffix_match:
+            suffix_time = normalize_time_for_excel(suffix_match.group(1))
+            if suffix_time:
+                bridge = normalized[date_end : date_end + suffix_match.end(1)]
+                score = 110
+                if "as" in bridge:
+                    score += 6
+                paired.append((-score, date_start, date_end, date_value, suffix_time))
+        for time_value, time_start, _time_end in time_candidates:
+            gap = time_start - date_end
+            if gap < 0 or gap > 20:
+                continue
+            bridge = normalized[date_end:time_start]
+            score = 100 - gap
+            if "as" in bridge:
+                score += 10
+            if "," in bridge or "." in bridge:
+                score += 2
+            paired.append((-score, date_start, time_start, date_value, time_value))
+
+    if paired:
+        paired.sort()
+        _score, _date_start, _time_start, date_value, time_value = paired[0]
+        return date_value, time_value
+
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    return _pick_best_date_candidate(lines), _pick_best_time_candidate(lines)
+
+
+def extract_first_date_value(text: str) -> Optional[str]:
+    txn_date, _txn_time = extract_datetime_values(text)
+    return txn_date
+
+
+def _count_date_matches(text: str) -> int:
+    normalized = normalize_ocr_text_for_parsing(text)
+    return len(_iter_date_candidates(normalized))
 
 
 def looks_like_single_receipt(text: str) -> tuple[bool, str]:
     low = text.lower()
     compact_low = re.sub(r"\s+", "", low)
     date_count = _count_date_matches(text)
-    time_count = len(TIME_PATTERN.findall(text))
+    time_count = len(_iter_time_candidates(normalize_ocr_text_for_parsing(text)))
     amount_count = len(AMOUNT_FALLBACK_PATTERN.findall(text)) + len(AMOUNT_CURRENCY_PATTERN.findall(text))
 
     has_strong_kw = any(
@@ -597,16 +822,51 @@ def normalize_amount(value: str) -> Optional[float]:
         return None
 
 
-def extract_best_amount(lines: list[str]) -> tuple[Optional[float], Optional[str]]:
-    candidates: list[tuple[int, int, int, float, Optional[str]]] = []
+def round_amount_for_output(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    dec = Decimal(str(value)).quantize(Decimal("0.01"))
+    integer = dec.to_integral_value(rounding=ROUND_FLOOR)
+    if (dec - integer) >= Decimal("0.50"):
+        integer += 1
+    return float(integer)
+
+
+def should_apply_compact_cent_fix(raw_value: str, currency: Optional[str], context_low: str) -> bool:
+    digits = re.sub(r"\D", "", raw_value or "")
+    if not digits or "." in raw_value or "," in raw_value:
+        return False
+    if currency != "BRL":
+        return False
+    if len(digits) < 4 or len(digits) > 6:
+        return False
+    if digits.endswith("00"):
+        return False
+    return any(token in context_low for token in COMPACT_AMOUNT_CONTEXT_HINTS)
+
+
+@dataclass(frozen=True)
+class AmountParseResult:
+    value: Optional[float]
+    rounded_value: Optional[float]
+    currency: Optional[str]
+    raw_value: Optional[str]
+    source: str
+    used_compact_cent_fix: bool = False
+
+
+def extract_best_amount(lines: list[str]) -> AmountParseResult:
+    candidates: list[tuple[int, int, int, float, Optional[str], str, str, bool]] = []
     order = 0
     for idx, line in enumerate(lines):
+        prev2_low = lines[idx - 2].lower() if idx > 1 else ""
         prev_low = lines[idx - 1].lower() if idx > 0 else ""
         line_low = line.lower()
         next_low = lines[idx + 1].lower() if idx + 1 < len(lines) else ""
-        context_low = " ".join(part for part in (prev_low, line_low, next_low) if part)
+        next2_low = lines[idx + 2].lower() if idx + 2 < len(lines) else ""
+        context_low = " ".join(part for part in (prev2_low, prev_low, line_low, next_low, next2_low) if part)
 
-        def score_candidate(raw_value: str, currency: Optional[str], source: str) -> int:
+        def score_candidate(raw_value: str, currency: Optional[str], source: str, used_compact_fix: bool) -> int:
             score = 30 if source == "currency" else 18
             if any(token in prev_low for token in AMOUNT_DIRECT_HINTS):
                 score += 18
@@ -624,15 +884,25 @@ def extract_best_amount(lines: list[str]) -> tuple[Optional[float], Optional[str
                 score += 2
             if "." not in raw_value and "," not in raw_value:
                 score -= 3
+            if used_compact_fix:
+                score += 7
             return score
 
         for m in AMOUNT_CURRENCY_PATTERN.finditer(line):
             raw_value = m.group(2)
+            currency = normalize_currency_code(m.group(1))
+            used_compact_fix = False
             value = normalize_amount(raw_value)
+            source = "currency"
+            if should_apply_compact_cent_fix(raw_value, currency, context_low):
+                compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
+                if compact_value is not None:
+                    value = compact_value
+                    used_compact_fix = True
+                    source = "currency_compact_cent_fix"
             if value is None:
                 continue
-            currency = normalize_currency_code(m.group(1))
-            candidates.append((score_candidate(raw_value, currency, "currency"), idx, order, value, currency))
+            candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix), idx, order, value, currency, raw_value, source, used_compact_fix))
             order += 1
 
         for m in AMOUNT_FALLBACK_PATTERN.finditer(line):
@@ -640,22 +910,29 @@ def extract_best_amount(lines: list[str]) -> tuple[Optional[float], Optional[str
             value = normalize_amount(raw_value)
             if value is None:
                 continue
-            candidates.append((score_candidate(raw_value, None, "fallback"), idx, order, value, None))
+            candidates.append((score_candidate(raw_value, None, "fallback", False), idx, order, value, None, raw_value, "fallback", False))
             order += 1
 
     if not candidates:
-        return (None, None)
+        return AmountParseResult(value=None, rounded_value=None, currency=None, raw_value=None, source="missing")
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    best_score, best_idx, _best_order, best_value, best_currency = candidates[0]
+    best_score, best_idx, _best_order, best_value, best_currency, best_raw_value, best_source, best_used_compact_fix = candidates[0]
     if best_currency is None:
-        for score, idx, _order, value, currency in candidates:
+        for score, idx, _order, value, currency, _raw_value, _source, _used_fix in candidates:
             if score != best_score or idx != best_idx or value != best_value:
                 continue
             if currency is not None:
                 best_currency = currency
                 break
-    return (best_value, best_currency)
+    return AmountParseResult(
+        value=best_value,
+        rounded_value=round_amount_for_output(best_value),
+        currency=best_currency,
+        raw_value=best_raw_value,
+        source=best_source,
+        used_compact_cent_fix=best_used_compact_fix,
+    )
 
 
 def prepare_image_for_ocr(img: Image.Image, source_kind: str) -> Image.Image:
@@ -685,15 +962,15 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     raw = "\n".join(lines)
 
-    txn_date = extract_first_date_value(raw)
+    parsed_txn_date, parsed_txn_time = extract_datetime_values(raw)
+    txn_date_source = "parsed" if parsed_txn_date else "fallback_today"
+    txn_time_source = "parsed" if parsed_txn_time else "fallback_dash"
+    txn_date = parsed_txn_date or today_local_date_str()
+    txn_time = parsed_txn_time or "-"
 
-    txn_time: Optional[str] = None
-    mt = TIME_PATTERN.search(raw)
-    if mt:
-        txn_time = mt.group(1)
-    txn_time = normalize_time_for_excel(txn_time)
-
-    amount, currency = extract_best_amount(lines)
+    amount_result = extract_best_amount(lines)
+    amount = amount_result.value
+    currency = amount_result.currency
     if amount is not None and currency is None:
         currency = "BRL"
 
@@ -736,8 +1013,8 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
     parse_conf = 0.0
     parse_conf += min(0.20, max(0.0, ocr_conf) * 0.20)
     parse_conf += 0.35 if amount is not None else 0.0
-    parse_conf += 0.20 if txn_date else 0.0
-    parse_conf += 0.10 if txn_time else 0.0
+    parse_conf += 0.20 if parsed_txn_date else 0.0
+    parse_conf += 0.10 if parsed_txn_time else 0.0
     parse_conf += 0.15 if beneficiary else 0.0
     parse_conf += 0.10 if bank else 0.0
     parse_conf += 0.10 if has_receipt_keyword else 0.0
@@ -746,14 +1023,73 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
 
     return {
         "txn_date": txn_date,
+        "txn_date_source": txn_date_source,
         "txn_time": txn_time,
+        "txn_time_source": txn_time_source,
         "beneficiary": beneficiary,
         "bank": bank,
         "amount": amount,
+        "amount_raw": amount_result.raw_value,
+        "amount_rounded": amount_result.rounded_value,
+        "amount_source": amount_result.source,
+        "amount_used_compact_cent_fix": amount_result.used_compact_cent_fix,
         "currency": currency,
         "parse_conf": parse_conf,
         "has_receipt_keyword": has_receipt_keyword,
     }
+
+
+def uses_thumb_fallback_resolution(resolution_source: Optional[str]) -> bool:
+    low = str(resolution_source or "").strip().lower()
+    return "thumb" in low and "fallback" in low
+
+
+def compute_review_needed(
+    fields: dict[str, Any],
+    bank: Optional[str],
+    quality_score_value: float,
+    verification_status: Optional[str],
+    min_confidence: float,
+    resolution_source: Optional[str],
+) -> bool:
+    using_thumb_fallback = uses_thumb_fallback_resolution(resolution_source)
+    quality_floor = 0.20 if using_thumb_fallback else 0.38
+    conf_floor = max(min_confidence, 0.70) if using_thumb_fallback else min_confidence
+    return (
+        fields.get("amount") is None
+        or bank is None
+        or fields.get("parse_conf", 0.0) < conf_floor
+        or quality_score_value < quality_floor
+        or verification_status != "CONFIRMADO"
+        or fields.get("txn_date_source") != "parsed"
+        or fields.get("txn_time_source") != "parsed"
+        or fields.get("amount_source") == "currency_compact_cent_fix"
+    )
+
+
+def build_sheet_payload_from_receipt(
+    receipt_payload: dict[str, Any],
+    existing_payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = dict(existing_payload or {})
+    payload.update(
+        {
+            "file_id": receipt_payload.get("file_id"),
+            "client": receipt_payload.get("client"),
+            "txn_date": receipt_payload.get("txn_date"),
+            "txn_time": receipt_payload.get("txn_time"),
+            "bank": receipt_payload.get("bank"),
+            "amount": (
+                receipt_payload.get("amount_rounded")
+                if receipt_payload.get("amount_rounded") is not None
+                else receipt_payload.get("amount")
+            ),
+            "verification_status": receipt_payload.get("verification_status"),
+            "msg_svr_id": receipt_payload.get("msg_svr_id"),
+            "talker": receipt_payload.get("talker"),
+        }
+    )
+    return payload
 
 
 @dataclass
@@ -1267,11 +1603,17 @@ class StateDB:
             self._ensure_column_exists(cur, "receipts", "resolved_media_path", "TEXT")
             self._ensure_column_exists(cur, "receipts", "resolution_source", "TEXT")
             self._ensure_column_exists(cur, "receipts", "verification_status", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "txn_date_source", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "txn_time_source", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "amount_raw", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "amount_rounded", "REAL")
+            self._ensure_column_exists(cur, "receipts", "amount_source", "TEXT")
             self._ensure_column_exists(cur, "receipts", "sheet_status", "TEXT")
             self._ensure_column_exists(cur, "receipts", "sheet_payload_json", "TEXT")
             self._ensure_column_exists(cur, "receipts", "sheet_next_attempt", "REAL")
             self._ensure_column_exists(cur, "receipts", "sheet_last_error", "TEXT")
             self._ensure_column_exists(cur, "receipts", "sheet_committed_at", "REAL")
+            self._ensure_column_exists(cur, "message_jobs", "activation_seen_at", "REAL NOT NULL DEFAULT 0")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sha256 ON receipts(sha256)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_msg_svr_id ON receipts(msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sheet_status_next ON receipts(sheet_status, sheet_next_attempt, msg_create_time)")
@@ -1294,6 +1636,15 @@ class StateDB:
                     sheet_committed_at=CASE
                         WHEN sheet_committed_at IS NULL AND excel_row IS NOT NULL THEN ingested_at
                         ELSE sheet_committed_at
+                    END
+                """
+            )
+            cur.execute(
+                """
+                UPDATE message_jobs
+                SET activation_seen_at=CASE
+                        WHEN COALESCE(activation_seen_at, 0) > 0 THEN activation_seen_at
+                        ELSE COALESCE(first_seen_at, create_time, 0)
                     END
                 """
             )
@@ -1414,6 +1765,14 @@ class StateDB:
             )
             self._conn.commit()
 
+    def get_manual_session_started_at(self) -> Optional[float]:
+        return self.get_meta_float(MANUAL_SESSION_META_KEY)
+
+    def start_manual_session(self, started_at: Optional[float] = None) -> float:
+        ts = float(started_at if started_at is not None else time.time())
+        self.set_meta(MANUAL_SESSION_META_KEY, f"{ts:.6f}")
+        return ts
+
     @staticmethod
     def _parse_bool_text(value: Any, default: bool = False) -> bool:
         if value is None:
@@ -1451,6 +1810,17 @@ class StateDB:
                 """,
                 (UI_FORCE_RUNTIME_META_KEY, "1" if enabled else "0", float(now)),
             )
+            if not enabled:
+                cur.execute(
+                    """
+                    INSERT INTO meta(key, value, updated_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value=excluded.value,
+                        updated_at=excluded.updated_at
+                    """,
+                    (MANUAL_SESSION_META_KEY, f"{float(now):.6f}", float(now)),
+                )
             if not enabled and release_waiting:
                 released_jobs = int(
                     cur.execute(
@@ -1622,8 +1992,9 @@ class StateDB:
             return next(iter(unique_groups.values()))
         return None
 
-    def claim_next(self) -> Optional[QueueItem]:
+    def claim_next(self, manual_session_started_at: Optional[float] = None) -> Optional[QueueItem]:
         now = time.time()
+        session_floor = float(manual_session_started_at or 0.0)
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
@@ -1636,6 +2007,17 @@ class StateDB:
                 WHERE f.status IN ('pending', 'retry')
                   AND f.next_attempt <= ?
                 ORDER BY
+                    CASE
+                        WHEN ? > 0 AND (
+                            CASE
+                                WHEN COALESCE(mj.activation_seen_at, mj.first_seen_at, 0) > COALESCE(f.first_seen, 0)
+                                    THEN COALESCE(mj.activation_seen_at, mj.first_seen_at, 0)
+                                ELSE COALESCE(f.first_seen, 0)
+                            END
+                        ) >= ? THEN 0
+                        WHEN ? > 0 THEN 1
+                        ELSE 0
+                    END ASC,
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN 0 ELSE 1 END ASC,
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.create_time END ASC,
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.msg_svr_id END ASC,
@@ -1644,7 +2026,7 @@ class StateDB:
                     f.next_attempt ASC
                 LIMIT 1
                 """,
-                (float(now),),
+                (float(now), session_floor, session_floor, session_floor),
             ).fetchone()
             if row is None:
                 self._conn.commit()
@@ -1915,10 +2297,11 @@ class StateDB:
                     parse_conf, quality_score, ocr_engine, ocr_conf, ocr_chars,
                     review_needed, ocr_text, parser_json, msg_svr_id, talker, msg_create_time,
                     resolved_media_path, resolution_source, verification_status,
+                    txn_date_source, txn_time_source, amount_raw, amount_rounded, amount_source,
                     sheet_status, sheet_payload_json, sheet_next_attempt, sheet_last_error, sheet_committed_at,
                     excel_sheet, excel_row
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     payload["file_id"],
@@ -1947,6 +2330,11 @@ class StateDB:
                     payload.get("resolved_media_path"),
                     payload.get("resolution_source"),
                     payload.get("verification_status"),
+                    payload.get("txn_date_source"),
+                    payload.get("txn_time_source"),
+                    payload.get("amount_raw"),
+                    payload.get("amount_rounded"),
+                    payload.get("amount_source"),
                     payload.get("sheet_status"),
                     payload.get("sheet_payload_json"),
                     payload.get("sheet_next_attempt"),
@@ -1971,21 +2359,24 @@ class StateDB:
         msg_create_time: float,
         msg_svr_id: Optional[str],
         file_id: str,
+        manual_session_started_at: Optional[float] = None,
     ) -> Optional[sqlite3.Row]:
         talker_value = str(talker or "").strip()
         if not talker_value or msg_create_time <= 0:
             return None
         sort_key = self._receipt_message_sort_key(msg_svr_id, file_id)
+        session_floor = float(manual_session_started_at or 0.0)
         with self._lock:
             return self._conn.execute(
                 """
-                SELECT file_id, msg_svr_id, msg_create_time, sheet_status
+                SELECT file_id, msg_svr_id, msg_create_time, sheet_status, ingested_at
                 FROM receipts
                 WHERE talker=?
                   AND file_id<>?
                   AND msg_create_time IS NOT NULL
                   AND msg_create_time > 0
                   AND COALESCE(sheet_status, '') NOT IN ('SINK_COMMITTED', 'SINK_SKIPPED_TERMINAL')
+                  AND (? <= 0 OR COALESCE(ingested_at, 0) >= ?)
                   AND (
                     msg_create_time < ?
                     OR (
@@ -1996,13 +2387,14 @@ class StateDB:
                 ORDER BY msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC
                 LIMIT 1
                 """,
-                (talker_value, str(file_id), float(msg_create_time), float(msg_create_time), sort_key),
+                (talker_value, str(file_id), session_floor, session_floor, float(msg_create_time), float(msg_create_time), sort_key),
             ).fetchone()
 
     def claim_next_sink_receipt(
         self,
         sheet_order_scope: str = "per_talker",
         commit_order: str = "asc",
+        manual_session_started_at: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         now = time.time()
         scope = str(sheet_order_scope or "per_talker").strip().lower() or "per_talker"
@@ -2010,6 +2402,7 @@ class StateDB:
         order_by = "msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC"
         if order == "desc":
             order_by = "msg_create_time DESC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) DESC"
+        session_floor = float(manual_session_started_at or 0.0)
 
         with self._lock:
             cur = self._conn.cursor()
@@ -2017,12 +2410,17 @@ class StateDB:
             rows = cur.execute(
                 f"""
                 SELECT file_id, source_path, ingested_at, review_needed, msg_svr_id, talker,
-                       msg_create_time, client, txn_date, txn_time, bank, amount, verification_status,
+                       msg_create_time, client, txn_date, txn_time, bank, amount, amount_rounded, verification_status,
                        sheet_payload_json, sheet_status
                 FROM receipts
                 WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
                   AND COALESCE(sheet_next_attempt, 0) <= ?
                 ORDER BY
+                    CASE
+                        WHEN ? > 0 AND COALESCE(ingested_at, 0) >= ? THEN 0
+                        WHEN ? > 0 THEN 1
+                        ELSE 0
+                    END ASC,
                     CASE
                         WHEN talker IS NOT NULL AND talker <> '' AND msg_create_time IS NOT NULL AND msg_create_time > 0
                             THEN 0
@@ -2031,7 +2429,7 @@ class StateDB:
                     {order_by},
                     ingested_at ASC
                 """,
-                (float(now),),
+                (float(now), session_floor, session_floor, session_floor),
             ).fetchall()
 
             for row in rows:
@@ -2046,6 +2444,7 @@ class StateDB:
                         msg_create_time=msg_create_time,
                         msg_svr_id=msg_svr_id,
                         file_id=file_id,
+                        manual_session_started_at=session_floor,
                     )
                     if prior_sink is not None:
                         blocker_id = self._receipt_message_sort_key(prior_sink["msg_svr_id"], str(prior_sink["file_id"]))
@@ -2055,6 +2454,7 @@ class StateDB:
                             talker=talker,
                             create_time=msg_create_time,
                             msg_svr_id=msg_svr_id,
+                            manual_session_started_at=session_floor,
                         )
                         if prior_job is not None:
                             blocker_note = f"WAITING_PRIOR_SINK_MESSAGE:{str(prior_job['msg_svr_id'])}"
@@ -2094,7 +2494,7 @@ class StateDB:
                         "txn_date": row["txn_date"],
                         "txn_time": row["txn_time"],
                         "bank": row["bank"],
-                        "amount": row["amount"],
+                        "amount": row["amount_rounded"] if row["amount_rounded"] is not None else row["amount"],
                         "verification_status": row["verification_status"],
                         "msg_svr_id": msg_svr_id,
                         "talker": talker,
@@ -2167,7 +2567,7 @@ class StateDB:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT first_seen_at
+                SELECT first_seen_at, activation_seen_at
                 FROM message_jobs
                 WHERE msg_svr_id=?
                 LIMIT 1
@@ -2175,13 +2575,14 @@ class StateDB:
                 (msg_svr_id,),
             ).fetchone()
             preserved_first_seen = float(row["first_seen_at"]) if row is not None else first_seen
+            activation_seen = max(float(row["activation_seen_at"] or 0.0), first_seen) if row is not None else first_seen
             self._conn.execute(
                 """
                 INSERT INTO message_jobs(
                     msg_svr_id, talker, talker_display, thumb_path, expected_image_path,
-                    create_time, state, first_seen_at, last_seen_at, next_ui_attempt_at
+                    create_time, state, first_seen_at, activation_seen_at, last_seen_at, next_ui_attempt_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, 'NEW', ?, ?, 0)
+                VALUES(?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, 0)
                 ON CONFLICT(msg_svr_id) DO UPDATE SET
                     talker=excluded.talker,
                     talker_display=COALESCE(NULLIF(excluded.talker_display, ''), message_jobs.talker_display),
@@ -2190,6 +2591,11 @@ class StateDB:
                     create_time=CASE
                         WHEN excluded.create_time > 0 THEN excluded.create_time
                         ELSE message_jobs.create_time
+                    END,
+                    activation_seen_at=CASE
+                        WHEN excluded.activation_seen_at > COALESCE(message_jobs.activation_seen_at, 0)
+                            THEN excluded.activation_seen_at
+                        ELSE COALESCE(message_jobs.activation_seen_at, 0)
                     END,
                     last_seen_at=excluded.last_seen_at
                 """,
@@ -2201,7 +2607,92 @@ class StateDB:
                     expected_str,
                     float(create_time),
                     preserved_first_seen,
+                    activation_seen,
                     float(now),
+                ),
+            )
+            self._conn.commit()
+
+    def list_receipts_needing_parser_backfill(self, limit: int = 5000) -> list[sqlite3.Row]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT file_id, ocr_text, ocr_conf, quality_score, client, bank, beneficiary,
+                       amount, amount_raw, amount_rounded, amount_source, currency,
+                       txn_date, txn_time, txn_date_source, txn_time_source,
+                       parse_conf, review_needed, parser_json, verification_status,
+                       sheet_status, sheet_payload_json, excel_sheet, excel_row,
+                       msg_svr_id, talker, resolution_source
+                FROM receipts
+                WHERE txn_date IS NULL OR TRIM(txn_date)=''
+                   OR txn_time IS NULL OR TRIM(txn_time)=''
+                   OR txn_date_source IS NULL OR TRIM(txn_date_source)=''
+                   OR txn_time_source IS NULL OR TRIM(txn_time_source)=''
+                   OR amount_raw IS NULL OR TRIM(amount_raw)=''
+                   OR amount_rounded IS NULL
+                   OR amount_source IS NULL OR TRIM(amount_source)=''
+                ORDER BY ingested_at ASC
+                LIMIT ?
+                """,
+                (int(max(1, limit)),),
+            ).fetchall()
+        return list(rows)
+
+    def update_receipt_parser_backfill(
+        self,
+        file_id: str,
+        *,
+        txn_date: Optional[str],
+        txn_time: Optional[str],
+        txn_date_source: Optional[str],
+        txn_time_source: Optional[str],
+        amount: Optional[float],
+        amount_raw: Optional[str],
+        amount_rounded: Optional[float],
+        amount_source: Optional[str],
+        currency: Optional[str],
+        bank: Optional[str],
+        parse_conf: Optional[float],
+        review_needed: bool,
+        parser_json: Optional[str],
+        sheet_payload_json: Optional[str],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE receipts
+                SET txn_date=?,
+                    txn_time=?,
+                    txn_date_source=?,
+                    txn_time_source=?,
+                    amount=?,
+                    amount_raw=?,
+                    amount_rounded=?,
+                    amount_source=?,
+                    currency=?,
+                    bank=?,
+                    parse_conf=COALESCE(?, parse_conf),
+                    review_needed=?,
+                    parser_json=?,
+                    sheet_payload_json=?
+                WHERE file_id=?
+                """,
+                (
+                    txn_date,
+                    txn_time,
+                    txn_date_source,
+                    txn_time_source,
+                    amount,
+                    amount_raw,
+                    amount_rounded,
+                    amount_source,
+                    currency,
+                    bank,
+                    parse_conf,
+                    1 if review_needed else 0,
+                    parser_json,
+                    sheet_payload_json,
+                    str(file_id),
                 ),
             )
             self._conn.commit()
@@ -2239,19 +2730,22 @@ class StateDB:
         talker: Optional[str],
         create_time: float,
         msg_svr_id: Optional[str],
+        manual_session_started_at: Optional[float] = None,
     ) -> Optional[sqlite3.Row]:
         talker_value = str(talker or "").strip()
         msg_value = str(msg_svr_id or "").strip()
         if not talker_value or create_time <= 0 or not msg_value:
             return None
+        session_floor = float(manual_session_started_at or 0.0)
         with self._lock:
             return self._conn.execute(
                 """
-                SELECT msg_svr_id, create_time, state, expected_image_path, thumb_path
+                SELECT msg_svr_id, create_time, state, expected_image_path, thumb_path, activation_seen_at
                 FROM message_jobs
                 WHERE talker=?
                   AND msg_svr_id<>?
                   AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION')
+                  AND (? <= 0 OR COALESCE(activation_seen_at, first_seen_at, create_time, 0) >= ?)
                   AND (
                     create_time < ?
                     OR (create_time = ? AND msg_svr_id < ?)
@@ -2259,7 +2753,7 @@ class StateDB:
                 ORDER BY create_time ASC, msg_svr_id ASC
                 LIMIT 1
                 """,
-                (talker_value, msg_value, float(create_time), float(create_time), msg_value),
+                (talker_value, msg_value, session_floor, session_floor, float(create_time), float(create_time), msg_value),
             ).fetchone()
 
     def set_message_job_state(
@@ -2596,6 +3090,9 @@ class RowSink:
     def append(self, row_payload: dict[str, Any], review_needed: bool) -> tuple[str, int]:
         raise NotImplementedError
 
+    def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
+        raise NotImplementedError
+
 
 class ExcelSink(RowSink):
     def __init__(self, excel_path: Path, verification_column_name: str = DEFAULT_VERIFICATION_COLUMN_NAME) -> None:
@@ -2651,20 +3148,24 @@ class ExcelSink(RowSink):
                 ws = wb.create_sheet(sheet)
                 ws.append(self.headers)
             ws = wb[sheet]
-            ws.append(
-                [
-                    row_payload.get("client"),
-                    row_payload.get("txn_date"),
-                    row_payload.get("txn_time"),
-                    row_payload.get("bank"),
-                    row_payload.get("amount"),
-                    row_payload.get("verification_status"),
-                ]
-            )
+            ws.append(build_sink_row_values(row_payload))
             row_idx = ws.max_row
             wb.save(self.excel_path)
             wb.close()
             return (sheet, row_idx)
+
+    def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
+        target_sheet = str(sheet_name or "").strip() or ("Revisar" if review_needed else "Lancamentos")
+        with self._lock:
+            wb = load_workbook(self.excel_path)
+            if target_sheet not in wb.sheetnames:
+                ws = wb.create_sheet(target_sheet)
+                ws.append(self.headers)
+            ws = wb[target_sheet]
+            for col_idx, value in enumerate(build_sink_row_values(row_payload), start=1):
+                ws.cell(row=max(2, int(row_idx)), column=col_idx, value=value)
+            wb.save(self.excel_path)
+            wb.close()
 
 
 class GoogleSheetsSink(RowSink):
@@ -2797,19 +3298,25 @@ class GoogleSheetsSink(RowSink):
             self._ensure_header(title)
             worksheet = self._worksheets_by_title[title]
             worksheet.append_row(
-                [
-                    row_payload.get("client"),
-                    row_payload.get("txn_date"),
-                    row_payload.get("txn_time"),
-                    row_payload.get("bank"),
-                    row_payload.get("amount"),
-                    row_payload.get("verification_status"),
-                ],
+                build_sink_row_values(row_payload),
                 value_input_option="USER_ENTERED",
                 table_range=sheet_table_range(self.headers),
             )
             row_idx = len(worksheet.col_values(1))
             return title, row_idx
+
+    def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
+        with self._lock:
+            title = str(sheet_name or "").strip() or self._target_sheet(review_needed)
+            if title not in self._worksheets_by_title:
+                title = self._ensure_sheet_exists(title)
+            self._ensure_header(title)
+            worksheet = self._worksheets_by_title[title]
+            worksheet.update(
+                range_name=sheet_row_range(self.headers, max(2, int(row_idx))),
+                values=[build_sink_row_values(row_payload)],
+                value_input_option="USER_ENTERED",
+            )
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -3025,15 +3532,23 @@ class UIForceDownloadWorker(threading.Thread):
 
 
 def has_core_signal(fields: dict[str, Any], bank: Optional[str]) -> bool:
-    return any(
-        value is not None and str(value).strip() != ""
-        for value in (fields.get("amount"), fields.get("txn_date"), fields.get("txn_time"), bank)
-    )
+    if fields.get("amount") is not None:
+        return True
+    if bank is not None and str(bank).strip():
+        return True
+    if fields.get("txn_date_source") == "parsed":
+        return True
+    return fields.get("txn_time_source") == "parsed"
+
+
+def is_manual_materialization_mode(db: StateDB, cfg: Config) -> bool:
+    return not db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)
 
 
 def get_prior_message_order_blocker(
     db: StateDB,
     msg_ref: Optional[WeChatMessageRef],
+    manual_session_started_at: Optional[float] = None,
 ) -> Optional[sqlite3.Row]:
     if msg_ref is None:
         return None
@@ -3041,6 +3556,7 @@ def get_prior_message_order_blocker(
         talker=msg_ref.talker,
         create_time=float(msg_ref.create_time or 0.0),
         msg_svr_id=msg_ref.msg_svr_id,
+        manual_session_started_at=manual_session_started_at,
     )
 
 
@@ -3057,6 +3573,8 @@ def resolve_media_candidate(
     wait_deadline = item.first_seen + float(cfg.original_wait_seconds)
     ui_force_deadline = item.first_seen + float(cfg.ui_force_delay_seconds)
     ui_force_runtime_enabled = db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)
+    manual_materialization_mode = not ui_force_runtime_enabled
+    manual_session_started_at = db.get_manual_session_started_at() if manual_materialization_mode else None
 
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
@@ -3103,7 +3621,7 @@ def resolve_media_candidate(
             client_source_path=resolved_client_source or client_source_path,
             first_seen_at=item.first_seen,
         )
-        order_blocker = get_prior_message_order_blocker(db, msg_ref)
+        order_blocker = get_prior_message_order_blocker(db, msg_ref, manual_session_started_at=manual_session_started_at)
         if order_blocker is not None:
             blocker_id = str(order_blocker["msg_svr_id"])
             db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
@@ -3121,6 +3639,19 @@ def resolve_media_candidate(
                 msg_ref=msg_ref,
                 using_thumb_fallback=False,
             )
+
+        if manual_materialization_mode:
+            if tracked_job is not None:
+                db.set_message_job_state(
+                    msg_ref.msg_svr_id if msg_ref is not None else None,
+                    "WAITING_ORIGINAL",
+                    note="MANUAL_WAIT_ORIGINAL",
+                    next_ui_attempt_at=0.0,
+                    reset_batch=True,
+                )
+            db.mark_hold(item.file_id, reason="MANUAL_WAIT_ORIGINAL", delay_sec=10)
+            print(f"[HOLD] {original_path.name} | manual_wait_original_from_temp")
+            return None
 
         return MediaResolution(
             original_source_path=original_path,
@@ -3147,7 +3678,7 @@ def resolve_media_candidate(
         client_source_path=client_source_path,
         first_seen_at=item.first_seen,
     )
-    order_blocker = get_prior_message_order_blocker(db, msg_ref)
+    order_blocker = get_prior_message_order_blocker(db, msg_ref, manual_session_started_at=manual_session_started_at)
     if order_blocker is not None:
         blocker_id = str(order_blocker["msg_svr_id"])
         db.mark_hold(item.file_id, reason=f"WAITING_PRIOR_MESSAGE_ORDER:{blocker_id}", delay_sec=10)
@@ -3184,6 +3715,19 @@ def resolve_media_candidate(
                 msg_ref=msg_ref,
                 using_thumb_fallback=False,
             )
+
+        if manual_materialization_mode:
+            if tracked_job is not None:
+                db.set_message_job_state(
+                    msg_ref.msg_svr_id if msg_ref is not None else None,
+                    "WAITING_ORIGINAL",
+                    note="MANUAL_WAIT_ORIGINAL",
+                    next_ui_attempt_at=0.0,
+                    reset_batch=True,
+                )
+            db.mark_hold(item.file_id, reason="MANUAL_WAIT_ORIGINAL", delay_sec=10 if now < wait_deadline else 15)
+            print(f"[HOLD] {original_path.name} | manual_wait_original")
+            return None
 
         tracked_state = str(tracked_job["state"] or "") if tracked_job is not None else ""
         if tracked_job is not None and tracked_state == "UI_FORCE_RUNNING" and now < wait_deadline:
@@ -3356,16 +3900,13 @@ def process_item(
             print(f"[EXCEPTION] {path.name} | missing_core_fields | verification={resolution.verification_status}")
             return
 
-        quality_floor = 0.20 if resolution.using_thumb_fallback else 0.38
-        conf_floor = max(cfg.min_confidence, 0.70) if resolution.using_thumb_fallback else cfg.min_confidence
-        review_needed = (
-            fields["amount"] is None
-            or fields["txn_date"] is None
-            or fields["txn_time"] is None
-            or bank is None
-            or fields["parse_conf"] < conf_floor
-            or q_score < quality_floor
-            or resolution.verification_status != "CONFIRMADO"
+        review_needed = compute_review_needed(
+            fields=fields,
+            bank=bank,
+            quality_score_value=q_score,
+            verification_status=resolution.verification_status,
+            min_confidence=cfg.min_confidence,
+            resolution_source=resolution.resolution_source,
         )
 
         payload: dict[str, Any] = {
@@ -3376,10 +3917,15 @@ def process_item(
             "sha256": digest,
             "txn_date": fields["txn_date"],
             "txn_time": fields["txn_time"],
+            "txn_date_source": fields.get("txn_date_source"),
+            "txn_time_source": fields.get("txn_time_source"),
             "client": client,
             "bank": bank,
             "beneficiary": fields["beneficiary"],
             "amount": fields["amount"],
+            "amount_raw": fields.get("amount_raw"),
+            "amount_rounded": fields.get("amount_rounded"),
+            "amount_source": fields.get("amount_source"),
             "currency": fields["currency"],
             "parse_conf": fields["parse_conf"],
             "quality_score": q_score,
@@ -3397,7 +3943,7 @@ def process_item(
             "verification_status": resolution.verification_status,
         }
 
-        row_payload = dict(payload)
+        row_payload = build_sheet_payload_from_receipt(payload)
         payload["sheet_status"] = "SINK_PENDING"
         payload["sheet_payload_json"] = json.dumps(row_payload, ensure_ascii=False)
         payload["sheet_next_attempt"] = 0.0
@@ -3450,10 +3996,12 @@ def process_item(
 def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int = 50) -> int:
     committed = 0
     limit = max(1, int(max_rows))
+    manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None
     for _ in range(limit):
         claimed = db.claim_next_sink_receipt(
             sheet_order_scope=cfg.sheet_order_scope,
             commit_order=cfg.sheet_commit_order,
+            manual_session_started_at=manual_session_started_at,
         )
         if claimed is None:
             break
@@ -3477,6 +4025,125 @@ def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int
             f"| create_time={msg_create_time:.0f} | sheet={sheet} | row={row}"
         )
     return committed
+
+
+def backfill_missing_receipt_fields(db: StateDB, sink: RowSink, cfg: Config, limit: int = 5000) -> tuple[int, int, int]:
+    rows = db.list_receipts_needing_parser_backfill(limit=limit)
+    if not rows:
+        return (0, 0, 0)
+
+    updated = 0
+    sheet_updated = 0
+    sheet_failed = 0
+    for row in rows:
+        ocr_text = str(row["ocr_text"] or "")
+        quality_score_value = float(row["quality_score"] or 0.0)
+        parsed = parse_receipt_fields(
+            ocr_text,
+            ocr_conf=float(row["ocr_conf"] or 0.0),
+            q_score=quality_score_value,
+        )
+
+        client = row["client"]
+        bank = row["bank"] or parsed.get("bank")
+        if not bank:
+            bank = detect_bank(f"{ocr_text}\n{client or ''}", row["beneficiary"])
+
+        amount = parsed.get("amount")
+        if amount is None and row["amount"] is not None:
+            amount = float(row["amount"])
+        amount_raw = parsed.get("amount_raw") or row["amount_raw"]
+        amount_rounded = parsed.get("amount_rounded")
+        if amount_rounded is None:
+            if row["amount_rounded"] is not None:
+                amount_rounded = float(row["amount_rounded"])
+            else:
+                amount_rounded = round_amount_for_output(amount)
+        amount_source = parsed.get("amount_source")
+        if not amount_source or amount_source == "missing":
+            amount_source = str(row["amount_source"] or "").strip() or "missing"
+        currency = parsed.get("currency") or row["currency"]
+        if currency is None and amount is not None:
+            currency = "BRL"
+
+        merged_fields = dict(parsed)
+        merged_fields["bank"] = bank
+        merged_fields["amount"] = amount
+        merged_fields["amount_raw"] = amount_raw
+        merged_fields["amount_rounded"] = amount_rounded
+        merged_fields["amount_source"] = amount_source
+        merged_fields["currency"] = currency
+
+        review_needed = bool(row["review_needed"]) or compute_review_needed(
+            fields=merged_fields,
+            bank=bank,
+            quality_score_value=quality_score_value,
+            verification_status=row["verification_status"],
+            min_confidence=cfg.min_confidence,
+            resolution_source=row["resolution_source"],
+        )
+
+        existing_sheet_payload: dict[str, Any] = {}
+        payload_json = str(row["sheet_payload_json"] or "").strip()
+        if payload_json:
+            try:
+                decoded = json.loads(payload_json)
+                if isinstance(decoded, dict):
+                    existing_sheet_payload = decoded
+            except Exception:
+                existing_sheet_payload = {}
+
+        receipt_payload = {
+            "file_id": row["file_id"],
+            "client": client,
+            "txn_date": merged_fields.get("txn_date"),
+            "txn_time": merged_fields.get("txn_time"),
+            "bank": bank,
+            "amount": amount,
+            "amount_rounded": amount_rounded,
+            "verification_status": row["verification_status"],
+            "msg_svr_id": row["msg_svr_id"],
+            "talker": row["talker"],
+        }
+        sheet_payload = build_sheet_payload_from_receipt(receipt_payload, existing_sheet_payload)
+
+        db.update_receipt_parser_backfill(
+            str(row["file_id"]),
+            txn_date=merged_fields.get("txn_date"),
+            txn_time=merged_fields.get("txn_time"),
+            txn_date_source=merged_fields.get("txn_date_source"),
+            txn_time_source=merged_fields.get("txn_time_source"),
+            amount=amount,
+            amount_raw=amount_raw,
+            amount_rounded=amount_rounded,
+            amount_source=amount_source,
+            currency=currency,
+            bank=bank,
+            parse_conf=merged_fields.get("parse_conf"),
+            review_needed=review_needed,
+            parser_json=json.dumps(merged_fields, ensure_ascii=False),
+            sheet_payload_json=json.dumps(sheet_payload, ensure_ascii=False),
+        )
+        updated += 1
+
+        row_idx = row["excel_row"]
+        if str(row["sheet_status"] or "").strip() == "SINK_COMMITTED" and row_idx is not None:
+            try:
+                sink.update_row(
+                    sheet_name=str(row["excel_sheet"] or "").strip(),
+                    row_idx=int(row_idx),
+                    row_payload=sheet_payload,
+                    review_needed=review_needed,
+                )
+                sheet_updated += 1
+            except Exception as exc:
+                sheet_failed += 1
+                print(
+                    f"[WARN] backfill_sheet_update_failed | file_id={row['file_id']} "
+                    f"| sheet={row['excel_sheet']} | row={row_idx} | err={type(exc).__name__}: {exc}"
+                )
+
+    return (updated, sheet_updated, sheet_failed)
 
 
 def default_watch_roots() -> list[Path]:
@@ -3745,6 +4412,7 @@ def main() -> int:
             db.set_ui_force_runtime_enabled(True, release_waiting=False)
     else:
         db.set_ui_force_runtime_enabled(False, release_waiting=False)
+        db.start_manual_session()
     ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
     if ignored_old:
         print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
@@ -3777,6 +4445,13 @@ def main() -> int:
     backfilled = db.backfill_receipt_context(resolver, limit=8000)
     if backfilled:
         print(f"[RECOVER] backfilled_receipt_context={backfilled}")
+    parser_backfilled, sheet_backfilled, sheet_backfill_failed = backfill_missing_receipt_fields(db, sink, cfg, limit=8000)
+    if parser_backfilled:
+        print(
+            f"[RECOVER] backfilled_receipt_fields={parser_backfilled}"
+            f" | sheet_updated={sheet_backfilled}"
+            f" | sheet_failed={sheet_backfill_failed}"
+        )
     try:
         ocr = build_ocr_engine()
     except Exception as exc:
@@ -3818,7 +4493,8 @@ def main() -> int:
                 print(f"[SCAN] reconcile complete | queued_or_refreshed={added}")
 
             flush_ready_sink_rows(db, sink, cfg, max_rows=50)
-            item = db.claim_next()
+            manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None
+            item = db.claim_next(manual_session_started_at=manual_session_started_at)
             if item is None:
                 flush_ready_sink_rows(db, sink, cfg, max_rows=50)
                 time.sleep(cfg.idle_sleep_seconds)
