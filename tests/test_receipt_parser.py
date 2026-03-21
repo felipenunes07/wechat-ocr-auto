@@ -25,6 +25,7 @@ class NormalizeAmountTests(unittest.TestCase):
     def test_brazilian_grouping_uses_thousands_separator(self) -> None:
         self.assertEqual(normalize_amount("30.000"), 30000.0)
         self.assertEqual(normalize_amount("2.525"), 2525.0)
+        self.assertEqual(normalize_amount("6.60102"), 6601.02)
 
     def test_decimal_values_keep_fraction(self) -> None:
         self.assertEqual(normalize_amount("2,5"), 2.5)
@@ -134,6 +135,87 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertEqual(fields["txn_date"], "02/02/2026")
         self.assertEqual(fields["txn_time"], "15:31")
         self.assertEqual(fields["amount"], 8727.85)
+
+    def test_parses_mercado_pago_superscript_cents_amount(self) -> None:
+        text = "\n".join(
+            [
+                "Mercado Pago",
+                "Comprovante de Pix",
+                "19/marco/2026 as 15h22",
+                "R$ 6.60102",
+                "Para",
+                "Cleend Intermediacao e Atacado Ltda",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["txn_date"], "19/03/2026")
+        self.assertEqual(fields["txn_time"], "15:22")
+        self.assertEqual(fields["amount"], 6601.02)
+        self.assertEqual(fields["amount_rounded"], 6601.0)
+
+    def test_ignores_cpf_chunk_when_value_line_was_lost_by_ocr(self) -> None:
+        text = "\n".join(
+            [
+                "Comprovante de",
+                "transferencia",
+                "19 MAR2026-18:12:43",
+                "Valoi",
+                "Tipo de transferencia",
+                "ID da transacao",
+                "E182361202026031",
+                "92112s16e16aa8b0",
+                "Nome",
+                "AMD REPRESENTACOES E",
+                "SERVICOSLTDA",
+                "CNPJ",
+                "53356830000112",
+                "Instituicao",
+                "BCO DO BRASIL S.A.",
+                "Chave Pix",
+                "53356830000112",
+                "Origem",
+                "Nome",
+                "Gleisson Silva",
+                "Instituicao",
+                "NU PAGAMENTOS-IP",
+                "CPF",
+                "...300.956...",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertIsNone(fields["amount"])
+        self.assertIsNone(fields["amount_rounded"])
+        self.assertEqual(fields["amount_source"], "missing")
+
+    def test_prefers_real_value_over_cpf_chunk_with_same_digits(self) -> None:
+        text = "\n".join(
+            [
+                "Comprovante de",
+                "transferencia",
+                "19 MAR2026-18:12:43",
+                "Valor",
+                "R$29.99",
+                "Tipo de transferencia",
+                "Pix",
+                "ID da transacao",
+                "92112s16e16aa8b0",
+                "Destino",
+                "AMD REPRESENTACOES E",
+                "SERVICOS LTDA",
+                "CPF",
+                "*.300.956**",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 29.99)
+        self.assertEqual(fields["amount_rounded"], 30.0)
+        self.assertEqual(fields["amount_source"], "currency")
 
     def test_falls_back_to_today_and_dash_when_datetime_missing(self) -> None:
         text = "\n".join(

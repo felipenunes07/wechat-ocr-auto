@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 WeChat receipt ingestion daemon (Windows-friendly).
 
@@ -855,8 +855,16 @@ def normalize_amount(value: str) -> Optional[float]:
 
     grouped_thousands_comma = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+", s))
     grouped_thousands_dot = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s))
+    grouped_thousands_comma_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d{2}", s))
+    grouped_thousands_dot_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d{2}", s))
 
-    if "," in s and "." in s:
+    if grouped_thousands_comma_compact_cent:
+        s = s.replace(",", "")
+        s = f"{s[:-2]}.{s[-2:]}"
+    elif grouped_thousands_dot_compact_cent:
+        s = s.replace(".", "")
+        s = f"{s[:-2]}.{s[-2:]}"
+    elif "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
@@ -924,6 +932,8 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
         next_low = lines[idx + 1].lower() if idx + 1 < len(lines) else ""
         next2_low = lines[idx + 2].lower() if idx + 2 < len(lines) else ""
         context_low = " ".join(part for part in (prev2_low, prev_low, line_low, next_low, next2_low) if part)
+        has_direct_hint = any(token in part for part in (prev_low, line_low, next_low) for token in AMOUNT_DIRECT_HINTS)
+        has_negative_hint = any(token in context_low for token in AMOUNT_NEGATIVE_HINTS)
 
         def score_candidate(raw_value: str, currency: Optional[str], source: str, used_compact_fix: bool) -> int:
             score = 30 if source == "currency" else 18
@@ -947,6 +957,19 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 score += 7
             return score
 
+        def should_skip_candidate(raw_value: str, source: str, currency: Optional[str]) -> bool:
+            del currency
+            if source != "fallback":
+                return False
+            if not has_negative_hint or has_direct_hint:
+                return False
+            digits = re.sub(r"\D", "", raw_value or "")
+            if len(digits) < 6:
+                return False
+            if re.search(r"[.,]\d{1,2}$", raw_value):
+                return False
+            return True
+
         for m in AMOUNT_CURRENCY_PATTERN.finditer(line):
             raw_value = m.group(2)
             currency = normalize_currency_code(m.group(1))
@@ -966,6 +989,8 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
 
         for m in AMOUNT_FALLBACK_PATTERN.finditer(line):
             raw_value = m.group(1)
+            if should_skip_candidate(raw_value, "fallback", None):
+                continue
             value = normalize_amount(raw_value)
             if value is None:
                 continue
