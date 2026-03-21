@@ -89,12 +89,14 @@ MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
 SESSION_PENDING_OPEN_STATE = "SESSION_PENDING_OPEN"
 IGNORED_SESSION_ROLLOVER_STATE = "IGNORED_SESSION_ROLLOVER"
 IGNORED_STALE_MANUAL_SESSION_STATE = "IGNORED_STALE_MANUAL_SESSION"
+IGNORED_BY_USER_STATE = "IGNORED_BY_USER"
 MANUAL_SESSION_TERMINAL_STATES = {
     "RESOLVED",
     "THUMB_FALLBACK",
     "EXCEPTION",
     IGNORED_SESSION_ROLLOVER_STATE,
     IGNORED_STALE_MANUAL_SESSION_STATE,
+    IGNORED_BY_USER_STATE,
 }
 MANUAL_OPEN_ONLY_WAIT_REASONS = (
     "MANUAL_WAIT_ORIGINAL",
@@ -3240,7 +3242,7 @@ class StateDB:
                         ELSE COALESCE(message_jobs.activation_seen_at, 0)
                     END,
                     state=CASE
-                        WHEN message_jobs.state IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION')
+                        WHEN message_jobs.state IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION', 'IGNORED_BY_USER')
                             THEN message_jobs.state
                         WHEN message_jobs.state = ? AND excluded.state <> ?
                             THEN excluded.state
@@ -3403,7 +3405,7 @@ class StateDB:
                 FROM message_jobs
                 WHERE talker=?
                   AND msg_svr_id<>?
-                  AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION')
+                  AND state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION', 'IGNORED_SESSION_ROLLOVER', 'IGNORED_STALE_MANUAL_SESSION', 'IGNORED_BY_USER')
                   AND (? = '' OR COALESCE(manual_session_id, '') = ?)
                   AND (? <= 0 OR COALESCE(activation_seen_at, first_seen_at, create_time, 0) >= ?)
                   AND (
