@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $dir "wechat_receipt_daemon.py"
 $db = Join-Path $dir "wechat_receipt_state.db"
@@ -187,23 +187,11 @@ if ($effectiveSinkMode -eq "google-sheets") {
 }
 
 $argumentLine = ($arguments | ForEach-Object { Convert-ToCliArg ([string]$_) }) -join " "
-$existingPids = @()
-try {
-  $existingPids = @(Get-Process -Name python -ErrorAction Stop | ForEach-Object { $_.Id })
-} catch {
-  $existingPids = @()
-}
-
-$cmdLine = 'start "" /b ' + (Convert-ToCliArg $py) + ' ' + $argumentLine + ' 1>> ' + (Convert-ToCliArg $logOut) + ' 2>> ' + (Convert-ToCliArg $logErr)
-cmd /c $cmdLine | Out-Null
-Start-Sleep -Seconds 2
 $p = $null
 try {
-  $p = Get-Process -Name python -ErrorAction Stop |
-    Where-Object { $existingPids -notcontains $_.Id } |
-    Sort-Object StartTime -Descending |
-    Select-Object -First 1
+  $p = Start-Process -FilePath $py -ArgumentList $argumentLine -WorkingDirectory $dir -WindowStyle Hidden -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
 } catch {
+  Write-Warning "Falha ao iniciar processo: $($_.Exception.Message)"
   $p = $null
 }
 if ($p) {
