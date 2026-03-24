@@ -181,7 +181,7 @@ def path_to_normalized_windows(path: Path) -> str:
 
 
 def build_lanc_headers(verification_column_name: str) -> list[str]:
-    return [*BASE_LANC_HEADERS, verification_column_name.strip() or DEFAULT_VERIFICATION_COLUMN_NAME]
+    return [*BASE_LANC_HEADERS]
 
 
 def sheet_header_range(headers: list[str]) -> str:
@@ -207,7 +207,6 @@ def build_sink_row_values(row_payload: dict[str, Any]) -> list[Any]:
         row_payload.get("txn_time"),
         row_payload.get("bank"),
         row_payload.get("amount"),
-        row_payload.get("verification_status"),
     ]
 
 
