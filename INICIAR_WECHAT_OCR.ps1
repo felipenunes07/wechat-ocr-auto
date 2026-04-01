@@ -45,7 +45,7 @@ if (!$watch -or !(Test-Path $watch)) {
 $sinkMode = "excel"
 $gsheetRef = ""
 $gsheetWorksheet = ""
-$gsheetReviewWorksheet = "Revisar"
+$gsheetReviewWorksheet = ""
 $recentFilesHours = 24
 $originalWaitSeconds = 90
 $tempCorrelationSeconds = 30
@@ -76,7 +76,7 @@ if (Test-Path $sinkConfigPath) {
   if ($sinkConfig.spreadsheet_url) { $gsheetRef = [string]$sinkConfig.spreadsheet_url }
   if ($sinkConfig.spreadsheet_id -and [string]::IsNullOrWhiteSpace($gsheetRef)) { $gsheetRef = [string]$sinkConfig.spreadsheet_id }
   if ($sinkConfig.worksheet) { $gsheetWorksheet = [string]$sinkConfig.worksheet }
-  if ($sinkConfig.review_worksheet) { $gsheetReviewWorksheet = [string]$sinkConfig.review_worksheet }
+  if ($null -ne $sinkConfig.review_worksheet) { $gsheetReviewWorksheet = [string]$sinkConfig.review_worksheet }
   if ($sinkConfig.recent_files_hours) { $recentFilesHours = [int]$sinkConfig.recent_files_hours }
   if ($sinkConfig.original_wait_seconds) { $originalWaitSeconds = [int]$sinkConfig.original_wait_seconds }
   if ($sinkConfig.temp_correlation_seconds) { $tempCorrelationSeconds = [int]$sinkConfig.temp_correlation_seconds }
@@ -195,6 +195,22 @@ try {
   $p = $null
 }
 if ($p) {
+  Start-Sleep -Seconds 2
+  $p.Refresh()
+  if ($p.HasExited) {
+    Write-Output "FALHOU_INICIAR. O processo encerrou logo apos iniciar."
+    Write-Output "EXIT_CODE=$($p.ExitCode)"
+    if (Test-Path $logOut) {
+      Write-Output "----- ULTIMAS LINHAS OUT -----"
+      Get-Content -Path $logOut -Tail 40 -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $logErr) {
+      Write-Output "----- ULTIMAS LINHAS ERR -----"
+      Get-Content -Path $logErr -Tail 40 -ErrorAction SilentlyContinue
+    }
+    exit 1
+  }
+
   $p.Id | Set-Content -Path $pidf -Encoding ascii
   Write-Output "INICIADO PID=$($p.Id)"
   Write-Output "LOG=$log"
@@ -222,5 +238,6 @@ if ($p) {
   Write-Output "SHEET_COMMIT_ORDER=$sheetCommitOrder"
 } else {
   Write-Output "FALHOU_INICIAR. Veja log: $log"
+  exit 1
 }
 

@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -157,6 +158,21 @@ def perf_duration_ms(start: float, end: float | None = None) -> float:
 
 def format_ms(value: Optional[float]) -> str:
     return "-" if value is None else f"{value:.0f}"
+
+
+def hold_retry_delay_seconds(now: float, deadline: float, minimum: int = 2, maximum: int = 5) -> int:
+    remaining = max(0.0, float(deadline) - float(now))
+    if remaining <= 0:
+        return max(1, int(minimum))
+    return max(int(minimum), min(int(maximum), int(remaining) if remaining >= 1.0 else 1))
+
+
+def runtime_media_resolver(media_resolver: Optional["WeChatDBResolver"]) -> Optional["WeChatDBResolver"]:
+    if media_resolver is None:
+        return None
+    if media_resolver.last_error:
+        return None
+    return media_resolver
 
 
 def detect_source_kind(path: Path) -> str:
@@ -386,7 +402,7 @@ DATE_PATTERNS = [
     re.compile(r"(?<!\d)(\d{1,2}/\d{1,2}/\d{2})(?!\d)"),
 ]
 ALPHA_MONTH_DATE_PATTERN = re.compile(
-    r"(?<!\d)(\d{1,2})(?:\s*de\s*|\s*[\/\-.]?\s*)([a-z]{3,12})\.?(?:\s*de\s*|\s*[\/\-.]?\s*)(\d{4})(?!\d)",
+    r"(?<!\d)(\d{1,2})(?:\s*de\s*|\s*[,\/\-.]?\s*)([a-z]{3,12})\.?(?:\s*de\s*|\s*[,\/\-.]?\s*)(\d{4})(?!\d)",
     re.IGNORECASE,
 )
 TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2}\s*(?::|h)\s*\d{2}(?:\s*(?::|h)\s*\d{2})?)(?!\d)", re.IGNORECASE)
@@ -525,13 +541,27 @@ BENEFICIARY_KEYS = [
     "destinatario",
     "recebedor",
     "recebedora",
-    "nome",
+    "para",
     "recebido por",
     "para:",
+    "destino",
     "收款方",
     "收款人",
     "对方",
 ]
+
+BENEFICIARY_SKIP_LABELS = {
+    "nome",
+    "origem",
+    "destino",
+    "cpf",
+    "cnpj",
+    "instituicao",
+    "instituição",
+    "chave pix",
+    "chavepix",
+    "id",
+}
 
 BANK_ALLOWED = ("AMD", "DIAMOND", "CLEEND")
 CLIENT_LABEL_SPECIAL_CASES = {
@@ -612,11 +642,39 @@ def normalize_ocr_text_for_parsing(value: str) -> str:
         .replace("／", "/")
         .replace("—", "-")
         .replace("–", "-")
+        .replace("·", " ")
+        .replace("•", " ")
         .replace("\u00a0", " ")
     )
     normalized = strip_accents(normalized).lower()
     normalized = re.sub(r"[^\S\n]+", " ", normalized)
     return normalized.strip()
+
+
+def extract_beneficiary_name(lines: list[str]) -> Optional[str]:
+    normalized_lines = [normalize_ocr_text_for_parsing(line) for line in lines]
+    for idx, low in enumerate(normalized_lines):
+        if not any(key in low for key in BENEFICIARY_KEYS):
+            continue
+
+        original = lines[idx].strip()
+        if ":" in original:
+            right = original.split(":", 1)[1].strip()
+            if right and normalize_ocr_text_for_parsing(right) not in BENEFICIARY_SKIP_LABELS:
+                return right
+
+        probe_idx = idx + 1
+        while probe_idx < len(lines):
+            candidate = lines[probe_idx].strip()
+            candidate_low = normalized_lines[probe_idx]
+            if not candidate:
+                probe_idx += 1
+                continue
+            if candidate_low in BENEFICIARY_SKIP_LABELS:
+                probe_idx += 1
+                continue
+            return candidate
+    return None
 
 
 def today_local_date_str() -> str:
@@ -1059,21 +1117,7 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
     if amount is not None and currency is None:
         currency = "BRL"
 
-    beneficiary: Optional[str] = None
-    low_lines = [ln.lower() for ln in lines]
-    for idx, low in enumerate(low_lines):
-        if any(k in low for k in BENEFICIARY_KEYS):
-            original = lines[idx]
-            if ":" in original:
-                right = original.split(":", 1)[1].strip()
-                if right:
-                    beneficiary = right
-                    break
-            if idx + 1 < len(lines):
-                nxt = lines[idx + 1].strip()
-                if nxt:
-                    beneficiary = nxt
-                    break
+    beneficiary = extract_beneficiary_name(lines)
 
     bank = detect_bank(raw, beneficiary)
 
@@ -1308,17 +1352,22 @@ class ClientResolver:
 
 
 class WeChatDBResolver:
+    _MERGE_RESULT_PREFIX = "__WXMERGE__"
+
     def __init__(self, watch_roots: list[Path], merge_path: Path, refresh_seconds: int = 10) -> None:
         self.watch_roots = [p.resolve() for p in watch_roots]
         self.wx_dirs = [p.parent.resolve() for p in self.watch_roots]
         self.wechat_root = self.wx_dirs[0].parent if self.wx_dirs else None
         self.merge_path = merge_path.resolve()
         self.refresh_seconds = max(5, int(refresh_seconds))
+        self.merge_timeout_seconds = 12
+        self.failure_backoff_seconds = max(30, self.refresh_seconds, self.merge_timeout_seconds * 2)
         self._pywxdump: Any = None
         self._decode_bytes_extra: Any = None
         self._wx_key: Optional[str] = None
         self._wx_dir: Optional[Path] = None
         self._last_refresh = 0.0
+        self._last_failure = 0.0
         self._last_error: Optional[str] = None
         self._lock = threading.Lock()
         self._load_dependencies()
@@ -1388,30 +1437,127 @@ class WeChatDBResolver:
         self._last_error = None
         return True
 
+    @classmethod
+    def _parse_merge_runner_output(cls, output: str) -> Optional[dict[str, Any]]:
+        prefix = cls._MERGE_RESULT_PREFIX
+        for line in reversed(str(output or "").splitlines()):
+            if not line.startswith(prefix):
+                continue
+            raw_payload = line[len(prefix) :].strip()
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                return None
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    def _terminate_process_tree(self, proc: subprocess.Popen[str]) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _merge_real_time_db_with_timeout(self) -> tuple[bool, str]:
+        assert self._wx_key is not None
+        assert self._wx_dir is not None
+
+        runner = (
+            "import json, sys\n"
+            "import pywxdump\n"
+            "code, ret = pywxdump.all_merge_real_time_db(sys.argv[1], sys.argv[2], sys.argv[3])\n"
+            f"print('{self._MERGE_RESULT_PREFIX}' + json.dumps({{'code': bool(code), 'ret': ret if isinstance(ret, str) else repr(ret)}}, ensure_ascii=False))\n"
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    "-c",
+                    runner,
+                    self._wx_key,
+                    str(self._wx_dir),
+                    str(self.merge_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+            stdout, stderr = proc.communicate(timeout=self.merge_timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+            out = str(stdout or "").strip()
+            err = str(stderr or "").strip()
+            detail = f"merge_runner_timeout:{self.merge_timeout_seconds}s"
+            if out:
+                detail += f"|out={out[-300:]}"
+            if err:
+                detail += f"|err={err[-300:]}"
+            return False, detail
+        except Exception as exc:
+            return False, f"merge_runner_failed:{type(exc).__name__}:{exc}"
+
+        payload = self._parse_merge_runner_output(stdout)
+        if payload is None:
+            stdout_tail = str(stdout or "").strip()[-300:]
+            stderr_tail = str(stderr or "").strip()[-300:]
+            return (
+                False,
+                f"merge_runner_invalid_output:exit={proc.returncode}|out={stdout_tail}|err={stderr_tail}",
+            )
+        return bool(payload.get("code")), str(payload.get("ret"))
+
+    def _mark_refresh_failure(self, now: float, detail: str) -> bool:
+        self._last_failure = now
+        self._last_error = detail
+        return False
+
     def refresh_if_due(self, force: bool = False) -> bool:
         with self._lock:
             now = time.time()
             if not force and self.merge_path.exists() and (now - self._last_refresh) < self.refresh_seconds:
                 return True
+            if not force and self._last_failure > 0 and (now - self._last_failure) < self.failure_backoff_seconds:
+                return False
             if not self._load_account_info(force=force):
+                self._last_failure = now
                 return False
             self.merge_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 assert self._pywxdump is not None
-                assert self._wx_key is not None
-                assert self._wx_dir is not None
-                code, ret = self._pywxdump.all_merge_real_time_db(
-                    self._wx_key,
-                    str(self._wx_dir),
-                    str(self.merge_path),
-                )
+                code, ret = self._merge_real_time_db_with_timeout()
             except Exception as exc:
-                self._last_error = f"merge_failed:{type(exc).__name__}:{exc}"
-                return False
+                return self._mark_refresh_failure(now, f"merge_failed:{type(exc).__name__}:{exc}")
             if not code:
-                self._last_error = f"merge_failed:{ret}"
-                return False
+                return self._mark_refresh_failure(now, f"merge_failed:{ret}")
             self._last_refresh = now
+            self._last_failure = 0.0
             self._last_error = None
             return True
 
@@ -2592,6 +2738,13 @@ class StateDB:
                         WHEN ? > 0 THEN 1
                         ELSE 0
                     END ASC,
+                    CASE f.source_kind
+                        WHEN 'msgattach_image_dat' THEN 0
+                        WHEN 'msgattach_image_plain' THEN 1
+                        WHEN 'temp_image' THEN 2
+                        WHEN 'msgattach_thumb_dat' THEN 3
+                        ELSE 4
+                    END ASC,
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN 0 ELSE 1 END ASC,
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_create_time END ASC,
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_svr_id END ASC,
@@ -2715,6 +2868,64 @@ class StateDB:
             )
             self._conn.commit()
             return len(stale_ids)
+
+    def recover_stale_processing(self, max_age_sec: int = 180) -> tuple[int, int]:
+        threshold = time.time() - max(30, int(max_age_sec))
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT f.file_id,
+                       f.processed_at,
+                       r.file_id AS receipt_file_id,
+                       r.ingested_at
+                FROM files AS f
+                LEFT JOIN receipts AS r
+                  ON r.file_id = f.file_id
+                WHERE f.status='processing'
+                  AND COALESCE(f.last_seen, 0) <= ?
+                ORDER BY f.last_seen ASC
+                """,
+                (float(threshold),),
+            ).fetchall()
+
+            if not rows:
+                return (0, 0)
+
+            done_rows: list[tuple[float, str, str]] = []
+            retry_rows: list[tuple[float, str, str]] = []
+            for row in rows:
+                file_id = str(row["file_id"])
+                if row["receipt_file_id"] is not None:
+                    processed_at = float(row["processed_at"] or row["ingested_at"] or now)
+                    done_rows.append((processed_at, "RECOVERED_PROCESSING_WITH_RECEIPT", file_id))
+                else:
+                    retry_rows.append((float(now), "RECOVERED_STALE_PROCESSING", file_id))
+
+            if done_rows:
+                self._conn.executemany(
+                    """
+                    UPDATE files
+                    SET status='done',
+                        processed_at=?,
+                        last_error=?
+                    WHERE file_id=?
+                    """,
+                    done_rows,
+                )
+            if retry_rows:
+                self._conn.executemany(
+                    """
+                    UPDATE files
+                    SET status='retry',
+                        next_attempt=?,
+                        last_error=?
+                    WHERE file_id=?
+                    """,
+                    retry_rows,
+                )
+            self._conn.commit()
+            return (len(retry_rows), len(done_rows))
 
     def mark_retry(
         self,
@@ -3966,8 +4177,9 @@ class GoogleSheetsSink(RowSink):
         self._headers_verified.add(title)
 
     def _target_sheet(self, review_needed: bool) -> str:
-        del review_needed
         main_title = self._main_sheet_title or self._resolve_main_sheet_title()
+        if review_needed and self.review_worksheet and self.review_worksheet != main_title:
+            return self.review_worksheet
         return main_title
 
     def append(self, row_payload: dict[str, Any], review_needed: bool) -> tuple[str, int]:
@@ -4487,7 +4699,11 @@ def resolve_media_candidate(
             )
         if context_path_str is None:
             if now < wait_deadline:
-                db.mark_hold(item.file_id, reason="WAITING_TEMP_CONTEXT", delay_sec=10)
+                db.mark_hold(
+                    item.file_id,
+                    reason="WAITING_TEMP_CONTEXT",
+                    delay_sec=hold_retry_delay_seconds(now, wait_deadline),
+                )
                 print(f"[HOLD] {original_path.name} | waiting_temp_context")
             else:
                 db.mark_done(item.file_id, sha256="", processed_at=now)
@@ -4552,7 +4768,11 @@ def resolve_media_candidate(
                     next_ui_attempt_at=0.0,
                     reset_batch=True,
                 )
-            db.mark_hold(item.file_id, reason="MANUAL_WAIT_ORIGINAL", delay_sec=10)
+            db.mark_hold(
+                item.file_id,
+                reason="MANUAL_WAIT_ORIGINAL",
+                delay_sec=hold_retry_delay_seconds(now, wait_deadline),
+            )
             print(f"[HOLD] {original_path.name} | manual_wait_original_from_temp")
             return None
 
@@ -4634,7 +4854,11 @@ def resolve_media_candidate(
                     next_ui_attempt_at=0.0,
                     reset_batch=True,
                 )
-            db.mark_hold(item.file_id, reason="MANUAL_WAIT_ORIGINAL", delay_sec=10 if now < wait_deadline else 15)
+            db.mark_hold(
+                item.file_id,
+                reason="MANUAL_WAIT_ORIGINAL",
+                delay_sec=hold_retry_delay_seconds(now, wait_deadline, minimum=2, maximum=5) if now < wait_deadline else 8,
+            )
             print(f"[HOLD] {original_path.name} | manual_wait_original")
             return None
 
@@ -4652,9 +4876,13 @@ def resolve_media_candidate(
                 reset_batch=True,
             )
 
-        if tracked_job is not None and now < ui_force_deadline:
+        if tracked_job is not None and ui_force_runtime_enabled and now < ui_force_deadline:
             db.set_message_job_state(msg_ref.msg_svr_id if msg_ref is not None else None, "WAITING_ORIGINAL", note="WAITING_ORIGINAL_MEDIA", next_ui_attempt_at=0.0, reset_batch=True)
-            db.mark_hold(item.file_id, reason="WAITING_ORIGINAL_MEDIA", delay_sec=10)
+            db.mark_hold(
+                item.file_id,
+                reason="WAITING_ORIGINAL_MEDIA",
+                delay_sec=hold_retry_delay_seconds(now, ui_force_deadline),
+            )
             print(f"[HOLD] {original_path.name} | waiting_original_media")
             return None
 
@@ -4666,7 +4894,11 @@ def resolve_media_candidate(
             return None
 
         if now < wait_deadline:
-            db.mark_hold(item.file_id, reason="WAITING_ORIGINAL_MEDIA", delay_sec=10)
+            db.mark_hold(
+                item.file_id,
+                reason="WAITING_ORIGINAL_MEDIA",
+                delay_sec=hold_retry_delay_seconds(now, wait_deadline),
+            )
             print(f"[HOLD] {original_path.name} | waiting_original_media")
             return None
 
@@ -4686,7 +4918,7 @@ def resolve_media_candidate(
                 next_ui_attempt_at=0.0,
                 reset_batch=True,
             )
-        db.mark_hold(item.file_id, reason="WAITING_ORIGINAL_MEDIA", delay_sec=15)
+        db.mark_hold(item.file_id, reason="WAITING_ORIGINAL_MEDIA", delay_sec=8)
         print(f"[HOLD] {original_path.name} | waiting_original_media_no_thumb_fallback")
         return None
 
@@ -4729,11 +4961,15 @@ def process_item(
     path = Path(item.path)
     resolution: Optional[MediaResolution] = None
     msg_svr_id: Optional[str] = None
+    active_media_resolver = runtime_media_resolver(media_resolver)
     try:
-        if media_resolver is not None:
-            media_resolver.refresh_if_due()
-
-        resolution = resolve_media_candidate(item=item, db=db, resolver=resolver, media_resolver=media_resolver, cfg=cfg)
+        resolution = resolve_media_candidate(
+            item=item,
+            db=db,
+            resolver=resolver,
+            media_resolver=active_media_resolver,
+            cfg=cfg,
+        )
         if resolution is None:
             return
 
@@ -5186,13 +5422,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sink-mode", choices=("excel", "google-sheets"), default=os.getenv("WECHAT_SINK_MODE", "excel"))
     p.add_argument("--gsheet-ref", default=os.getenv("WECHAT_GSHEET_REF", ""))
     p.add_argument("--gsheet-worksheet", default=os.getenv("WECHAT_GSHEET_WORKSHEET", ""))
-    p.add_argument("--gsheet-review-worksheet", default=os.getenv("WECHAT_GSHEET_REVIEW_WORKSHEET", "Revisar"))
+    p.add_argument("--gsheet-review-worksheet", default=os.getenv("WECHAT_GSHEET_REVIEW_WORKSHEET", ""))
     p.add_argument("--google-credentials-path", default=os.getenv("WECHAT_GOOGLE_CREDENTIALS_PATH", ""))
     p.add_argument("--verification-column-name", default=os.getenv("WECHAT_VERIFICATION_COLUMN_NAME", DEFAULT_VERIFICATION_COLUMN_NAME))
     p.add_argument("--client-map-path", default=str(Path.cwd() / "clientes_grupos.json"))
     p.add_argument("--resolution-mode", choices=("path-only", "db-first"), default=os.getenv("WECHAT_RESOLUTION_MODE", "db-first"))
     p.add_argument("--db-merge-path", default=os.getenv("WECHAT_DB_MERGE_PATH", str(Path.cwd() / ".runtime" / "wechat_merge.db")))
-    p.add_argument("--settle-seconds", type=int, default=5)
+    p.add_argument("--settle-seconds", type=int, default=1)
     p.add_argument("--reconcile-seconds", type=int, default=90)
     p.add_argument("--recent-files-hours", type=int, default=int(os.getenv("WECHAT_RECENT_FILES_HOURS", "24")))
     p.add_argument("--idle-sleep-seconds", type=float, default=1.2)
@@ -5243,7 +5479,7 @@ def build_config(args: argparse.Namespace) -> Config:
         retry_base_seconds=max(10, args.retry_base_seconds),
         min_confidence=max(0.0, min(1.0, args.min_confidence)),
         max_retries=max(0, args.max_retries),
-        original_wait_seconds=max(30, int(args.original_wait_seconds)),
+        original_wait_seconds=max(5, int(args.original_wait_seconds)),
         temp_correlation_seconds=max(5, int(args.temp_correlation_seconds)),
         thumb_candidates_enabled=parse_boolish(args.thumb_candidates_enabled, default=False),
         manual_order_guard_enabled=parse_boolish(args.manual_order_guard_enabled, default=True),
@@ -5314,6 +5550,7 @@ def main() -> int:
     print(f"Recent files window (hours): {cfg.recent_files_hours}")
     print(f"Resolution mode: {cfg.resolution_mode}")
     print(f"DB merge path: {cfg.db_merge_path}")
+    print(f"Settle (seconds): {cfg.settle_seconds}")
     print(f"Original wait (seconds): {cfg.original_wait_seconds}")
     print(f"Temp correlation (seconds): {cfg.temp_correlation_seconds}")
     print(f"Thumb candidates enabled: {cfg.thumb_candidates_enabled}")
@@ -5385,6 +5622,14 @@ def main() -> int:
     cleaned_temp_orphans = db.cleanup_stale_temp_orphans(max_age_sec=max(600, cfg.original_wait_seconds * 4))
     if cleaned_temp_orphans:
         print(f"[RECOVER] stale_temp_orphans={cleaned_temp_orphans}")
+    recovered_processing_retry, recovered_processing_done = db.recover_stale_processing(
+        max_age_sec=max(180, cfg.original_wait_seconds * 2)
+    )
+    if recovered_processing_retry or recovered_processing_done:
+        print(
+            f"[RECOVER] stale_processing_retry={recovered_processing_retry} "
+            f"| stale_processing_done={recovered_processing_done}"
+        )
     try:
         sink = build_sink(cfg)
     except Exception as exc:

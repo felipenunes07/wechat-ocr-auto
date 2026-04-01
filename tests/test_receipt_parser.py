@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,15 +8,18 @@ from unittest.mock import patch
 from wechat_receipt_daemon import (
     IGNORED_SESSION_ROLLOVER_STATE,
     SESSION_PENDING_OPEN_STATE,
+    GoogleSheetsSink,
     StateDB,
     WeChatDBResolver,
     WeChatMessageRef,
     backfill_missing_receipt_fields,
+    hold_retry_delay_seconds,
     is_candidate,
     normalize_amount,
     normalize_client_label,
     parse_receipt_fields,
     round_amount_for_output,
+    runtime_media_resolver,
     seed_ready_manual_session_placeholders,
     should_ignore_sender,
 )
@@ -35,6 +39,27 @@ class NormalizeAmountTests(unittest.TestCase):
         self.assertEqual(round_amount_for_output(1.52), 2.0)
         self.assertEqual(round_amount_for_output(1.49), 1.0)
         self.assertEqual(round_amount_for_output(0.50), 1.0)
+
+
+class HoldRetryDelayTests(unittest.TestCase):
+    def test_caps_retry_window_for_fast_manual_rechecks(self) -> None:
+        self.assertEqual(hold_retry_delay_seconds(100.0, 107.0), 5)
+        self.assertEqual(hold_retry_delay_seconds(100.0, 103.0), 3)
+        self.assertEqual(hold_retry_delay_seconds(100.0, 100.4), 2)
+
+
+class RuntimeMediaResolverTests(unittest.TestCase):
+    def test_returns_none_when_resolver_is_degraded(self) -> None:
+        resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+        resolver._last_error = "merge_failed:timeout"
+
+        self.assertIsNone(runtime_media_resolver(resolver))
+
+    def test_keeps_resolver_when_no_runtime_error(self) -> None:
+        resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+        resolver._last_error = None
+
+        self.assertIs(runtime_media_resolver(resolver), resolver)
 
 
 class ParseReceiptFieldsTests(unittest.TestCase):
@@ -135,6 +160,36 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertEqual(fields["txn_date"], "02/02/2026")
         self.assertEqual(fields["txn_time"], "15:31")
         self.assertEqual(fields["amount"], 8727.85)
+
+    def test_parses_infinitepay_style_destination_and_alpha_month_date(self) -> None:
+        text = "\n".join(
+            [
+                "infinitepay",
+                "Comprovante de transferencia Pix",
+                "R$ 600,00",
+                "28 Mar,2026 14:46",
+                "Origem",
+                "IRIS PANTOJA SANTIAGO",
+                "CPF",
+                ".499.782-",
+                "Instituicao",
+                "CLOUDWALK IP LTDA",
+                "Destino",
+                "AMD REPRESENTACOES E SERVICOS LTDA",
+                "CNPJ",
+                "53.356.830/0001-12",
+                "Instituicao",
+                "BCO DO BRASIL S.A.",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["txn_date"], "28/03/2026")
+        self.assertEqual(fields["txn_time"], "14:46")
+        self.assertEqual(fields["beneficiary"], "AMD REPRESENTACOES E SERVICOS LTDA")
+        self.assertEqual(fields["bank"], "AMD")
+        self.assertEqual(fields["amount"], 600.0)
 
     def test_parses_mercado_pago_superscript_cents_amount(self) -> None:
         text = "\n".join(
@@ -632,6 +687,37 @@ class ManualSessionOrderTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_claim_next_prefers_direct_image_before_temp_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="temp-file",
+                    path="C:/fake/temp-file.jpg",
+                    source_kind="temp_image",
+                    status="pending",
+                    first_seen=1000.0,
+                    last_error=None,
+                )
+                insert_file_row(
+                    db,
+                    file_id="direct-file",
+                    path="C:/fake/direct-file.dat",
+                    source_kind="msgattach_image_dat",
+                    status="pending",
+                    first_seen=1001.0,
+                    last_error=None,
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=1010.0):
+                    claimed = db.claim_next()
+
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.file_id, "direct-file")
+            finally:
+                db.close()
+
     def test_seed_ready_manual_session_placeholders_only_within_burst_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = StateDB(Path(tmp_dir) / "state.db")
@@ -861,6 +947,151 @@ class ManualOpenOnlyCleanupTests(unittest.TestCase):
                 db.close()
 
 
+class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
+    def test_parse_merge_runner_output_reads_prefixed_json(self) -> None:
+        output = "\n".join(
+            [
+                "warning line",
+                "__WXMERGE__{\"code\": true, \"ret\": \"C:/tmp/merge.db\"}",
+            ]
+        )
+
+        payload = WeChatDBResolver._parse_merge_runner_output(output)
+
+        self.assertEqual(payload, {"code": True, "ret": "C:/tmp/merge.db"})
+
+    def test_parse_merge_runner_output_returns_none_without_marker(self) -> None:
+        self.assertIsNone(WeChatDBResolver._parse_merge_runner_output("warning only"))
+
+    def _build_resolver(self, tmp_dir: str) -> WeChatDBResolver:
+        resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+        resolver.watch_roots = []
+        resolver.wx_dirs = []
+        resolver.wechat_root = None
+        resolver.merge_path = Path(tmp_dir) / "merge.db"
+        resolver.refresh_seconds = 10
+        resolver.merge_timeout_seconds = 12
+        resolver.failure_backoff_seconds = 60
+        resolver._pywxdump = object()
+        resolver._decode_bytes_extra = object()
+        resolver._wx_key = "key"
+        resolver._wx_dir = Path(tmp_dir)
+        resolver._last_refresh = 0.0
+        resolver._last_failure = 0.0
+        resolver._last_error = None
+        resolver._lock = threading.Lock()
+        resolver._load_account_info = lambda force=False: True
+        return resolver
+
+    def test_refresh_if_due_backs_off_after_failed_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = self._build_resolver(tmp_dir)
+            merge_calls: list[str] = []
+
+            def fake_merge() -> tuple[bool, str]:
+                merge_calls.append("merge")
+                return False, "timeout"
+
+            resolver._merge_real_time_db_with_timeout = fake_merge
+
+            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 105.0, 170.0]):
+                self.assertFalse(resolver.refresh_if_due())
+                self.assertFalse(resolver.refresh_if_due())
+                self.assertFalse(resolver.refresh_if_due())
+
+            self.assertEqual(merge_calls, ["merge", "merge"])
+            self.assertEqual(resolver.last_error, "merge_failed:timeout")
+            self.assertEqual(resolver._last_failure, 170.0)
+
+    def test_refresh_if_due_clears_failure_after_successful_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = self._build_resolver(tmp_dir)
+            merge_calls: list[str] = []
+            results = [(False, "timeout"), (True, str(resolver.merge_path))]
+
+            def fake_merge() -> tuple[bool, str]:
+                merge_calls.append("merge")
+                ok, ret = results.pop(0)
+                if ok:
+                    resolver.merge_path.write_text("ok", encoding="utf-8")
+                return ok, ret
+
+            resolver._merge_real_time_db_with_timeout = fake_merge
+
+            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 170.0, 175.0]):
+                self.assertFalse(resolver.refresh_if_due())
+                self.assertTrue(resolver.refresh_if_due())
+                self.assertTrue(resolver.refresh_if_due())
+
+            self.assertEqual(merge_calls, ["merge", "merge"])
+            self.assertEqual(resolver._last_failure, 0.0)
+            self.assertIsNone(resolver.last_error)
+
+
+class StaleProcessingRecoveryTests(unittest.TestCase):
+    def test_requeues_processing_row_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="stale-processing",
+                    path="C:/fake/stale-processing.dat",
+                    source_kind="msgattach_image_dat",
+                    status="processing",
+                    first_seen=100.0,
+                    last_error=None,
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=500.0):
+                    retry_count, done_count = db.recover_stale_processing(max_age_sec=120)
+
+                self.assertEqual((retry_count, done_count), (1, 0))
+                row = db.get_file("stale-processing")
+                self.assertIsNotNone(row)
+                self.assertEqual(row["status"], "retry")
+                self.assertEqual(row["last_error"], "RECOVERED_STALE_PROCESSING")
+                self.assertEqual(row["next_attempt"], 500.0)
+            finally:
+                db.close()
+
+    def test_marks_processing_row_done_when_receipt_already_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="stale-with-receipt",
+                    path="C:/fake/stale-with-receipt.dat",
+                    source_kind="msgattach_image_dat",
+                    status="processing",
+                    first_seen=100.0,
+                    last_error=None,
+                )
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="stale-with-receipt",
+                        ingested_at=230.0,
+                        msg_svr_id="msg-1",
+                        msg_create_time=200.0,
+                        amount=668.0,
+                        amount_rounded=668.0,
+                    )
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=500.0):
+                    retry_count, done_count = db.recover_stale_processing(max_age_sec=120)
+
+                self.assertEqual((retry_count, done_count), (0, 1))
+                row = db.get_file("stale-with-receipt")
+                self.assertIsNotNone(row)
+                self.assertEqual(row["status"], "done")
+                self.assertEqual(row["last_error"], "RECOVERED_PROCESSING_WITH_RECEIPT")
+                self.assertEqual(row["processed_at"], 230.0)
+            finally:
+                db.close()
+
+
 class RecordingSink:
     def __init__(self) -> None:
         self.updated_rows: list[tuple[str, int, dict[str, object], bool]] = []
@@ -870,6 +1101,30 @@ class RecordingSink:
 
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, object], review_needed: bool) -> None:
         self.updated_rows.append((sheet_name, row_idx, row_payload, review_needed))
+
+
+class GoogleSheetsSinkTargetSheetTests(unittest.TestCase):
+    def test_review_items_use_review_sheet_when_configured(self) -> None:
+        sink = GoogleSheetsSink.__new__(GoogleSheetsSink)
+        sink.review_worksheet = "Revisar"
+        sink._main_sheet_title = "Pagina1"
+
+        self.assertEqual(sink._target_sheet(review_needed=False), "Pagina1")
+        self.assertEqual(sink._target_sheet(review_needed=True), "Revisar")
+
+    def test_review_items_fall_back_to_main_sheet_when_review_sheet_matches_main(self) -> None:
+        sink = GoogleSheetsSink.__new__(GoogleSheetsSink)
+        sink.review_worksheet = "Pagina1"
+        sink._main_sheet_title = "Pagina1"
+
+        self.assertEqual(sink._target_sheet(review_needed=True), "Pagina1")
+
+    def test_review_items_use_main_sheet_when_review_sheet_disabled(self) -> None:
+        sink = GoogleSheetsSink.__new__(GoogleSheetsSink)
+        sink.review_worksheet = None
+        sink._main_sheet_title = "Pagina1"
+
+        self.assertEqual(sink._target_sheet(review_needed=True), "Pagina1")
 
 
 class ReceiptBackfillTests(unittest.TestCase):
