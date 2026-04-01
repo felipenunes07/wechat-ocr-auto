@@ -13,6 +13,7 @@ from wechat_receipt_daemon import (
     WeChatDBResolver,
     WeChatMessageRef,
     backfill_missing_receipt_fields,
+    candidate_initial_delay_seconds,
     hold_retry_delay_seconds,
     is_candidate,
     normalize_amount,
@@ -46,6 +47,13 @@ class HoldRetryDelayTests(unittest.TestCase):
         self.assertEqual(hold_retry_delay_seconds(100.0, 107.0), 5)
         self.assertEqual(hold_retry_delay_seconds(100.0, 103.0), 3)
         self.assertEqual(hold_retry_delay_seconds(100.0, 100.4), 2)
+
+
+class CandidateInitialDelayTests(unittest.TestCase):
+    def test_temp_preview_waits_a_bit_longer_when_direct_images_are_preferred(self) -> None:
+        self.assertEqual(candidate_initial_delay_seconds("temp_image", 1, thumb_candidates_enabled=False), 3)
+        self.assertEqual(candidate_initial_delay_seconds("msgattach_image_dat", 1, thumb_candidates_enabled=False), 1)
+        self.assertEqual(candidate_initial_delay_seconds("temp_image", 5, thumb_candidates_enabled=False), 5)
 
 
 class RuntimeMediaResolverTests(unittest.TestCase):

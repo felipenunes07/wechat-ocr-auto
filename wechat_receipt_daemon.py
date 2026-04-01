@@ -175,6 +175,13 @@ def runtime_media_resolver(media_resolver: Optional["WeChatDBResolver"]) -> Opti
     return media_resolver
 
 
+def candidate_initial_delay_seconds(source_kind: str, settle_seconds: int, thumb_candidates_enabled: bool) -> int:
+    base_delay = max(1, int(settle_seconds))
+    if source_kind == "temp_image" and not thumb_candidates_enabled:
+        return max(3, base_delay)
+    return base_delay
+
+
 def detect_source_kind(path: Path) -> str:
     s = str(path).lower().replace("/", "\\")
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
@@ -2004,7 +2011,7 @@ class StateDB:
         file_id = self.compute_file_id(path, st)
         source_kind = detect_source_kind(path)
         ext = path.suffix.lower()
-        next_attempt = now + max(1, settle_seconds)
+        next_attempt = now + candidate_initial_delay_seconds(source_kind, settle_seconds, thumb_candidates_enabled)
         refresh_manual_session = should_refresh_manual_session(source_kind, source_event)
         candidate_id: Optional[str] = None
 
