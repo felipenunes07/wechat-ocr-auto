@@ -26,6 +26,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -38,6 +39,26 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageFilter, ImageOps, ImageStat
 from openpyxl import Workbook, load_workbook
+
+try:
+    import pillow_heif  # type: ignore
+
+    pillow_heif.register_heif_opener()
+    PILLOW_HEIF_AVAILABLE = True
+    PILLOW_HEIF_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:
+    PILLOW_HEIF_AVAILABLE = False
+    PILLOW_HEIF_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+try:
+    import cv2  # type: ignore
+
+    OPENCV_AVAILABLE = True
+    OPENCV_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:
+    cv2 = None  # type: ignore[assignment]
+    OPENCV_AVAILABLE = False
+    OPENCV_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:
     from watchdog.events import FileSystemEventHandler
@@ -85,12 +106,23 @@ UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
 MANUAL_SESSION_ID_META_KEY = "manual_session_id"
 REALTIME_SOURCE_EVENTS = {"created", "modified", "ui-force"}
-MANUAL_OPEN_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "temp_image"}
+MANUAL_OPEN_SOURCE_KINDS = {"cache_image_temp", "temp_image"}
+DIRECT_MSGATTACH_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "msgattach_thumb_dat"}
+PREOPEN_MSGATTACH_MIN_AGE_SECONDS = 10
+CONVERSATION_BURST_WINDOW_SECONDS = 4
+CONVERSATION_BURST_VARIANT_THRESHOLD = 4
+MANUAL_VIEWER_EVENT_WINDOW_SECONDS = 8
+MANUAL_BUBBLE_CONTEXT_MAX_AGE_SECONDS = 120
+MANUAL_BUBBLE_PAIR_MTIME_DELTA_SECONDS = 3
+MANUAL_VIEWER_POLL_SECONDS = 0.2
 MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
 SESSION_PENDING_OPEN_STATE = "SESSION_PENDING_OPEN"
 IGNORED_SESSION_ROLLOVER_STATE = "IGNORED_SESSION_ROLLOVER"
 IGNORED_STALE_MANUAL_SESSION_STATE = "IGNORED_STALE_MANUAL_SESSION"
 IGNORED_BY_USER_STATE = "IGNORED_BY_USER"
+MANUAL_OPEN_EVENT_PENDING_STATE = "PENDING"
+MANUAL_OPEN_EVENT_CLAIMED_STATE = "CLAIMED"
+MANUAL_OPEN_EVENT_EXPIRED_STATE = "EXPIRED"
 MANUAL_SESSION_TERMINAL_STATES = {
     "RESOLVED",
     "THUMB_FALLBACK",
@@ -114,23 +146,33 @@ MANUAL_SESSION_FILE_HOLD_PREFIXES = (
 def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     if not path.is_file():
         return False
-    if path.suffix.lower() not in IMG_SUFFIXES:
+    if not is_cache_image_temp_path(path) and path.suffix.lower() not in IMG_SUFFIXES:
         return False
 
     s = str(path).lower().replace("/", "\\")
 
-    if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
+    has_attach = "\\msgattach\\" in s or "\\msg\\attach\\" in s
+    has_image = "\\image\\" in s or "\\img\\" in s
+    has_thumb = "\\thumb\\" in s or "\\img\\" in s
+
+    if has_attach and has_image and path.suffix.lower() == ".dat" and not path.name.lower().endswith("_t.dat"):
         return True
 
     # WeChat can store full images in plain formats (.png/.jpg) under MsgAttach/Image.
-    if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() in PLAIN_IMAGE_SUFFIXES:
+    if has_attach and has_image and path.suffix.lower() in PLAIN_IMAGE_SUFFIXES:
         return True
 
     # Optional fallback lane when thumbnail-only processing is desired.
+    if thumb_candidates_enabled and has_attach and has_thumb and path.suffix.lower() == ".dat" and path.name.lower().endswith("_t.dat"):
+        return True
+    
     if thumb_candidates_enabled and "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
         return True
 
     if "\\filestorage\\temp\\" in s and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        return True
+
+    if is_cache_image_temp_path(path):
         return True
 
     return False
@@ -138,6 +180,10 @@ def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
 
 def should_refresh_manual_session(source_kind: str, source_event: str) -> bool:
     return source_kind in MANUAL_OPEN_SOURCE_KINDS and str(source_event or "").strip().lower() in REALTIME_SOURCE_EVENTS
+
+
+def is_manual_open_source_kind(source_kind: str) -> bool:
+    return str(source_kind or "").strip().lower() in MANUAL_OPEN_SOURCE_KINDS
 
 
 def is_message_job_terminal_state(state: Optional[str]) -> bool:
@@ -177,20 +223,48 @@ def runtime_media_resolver(media_resolver: Optional["WeChatDBResolver"]) -> Opti
 
 def candidate_initial_delay_seconds(source_kind: str, settle_seconds: int, thumb_candidates_enabled: bool) -> int:
     base_delay = max(1, int(settle_seconds))
-    if source_kind == "temp_image" and not thumb_candidates_enabled:
+    if source_kind in {"temp_image", "cache_image_temp"} and not thumb_candidates_enabled:
         return max(3, base_delay)
     return base_delay
 
 
+def should_ignore_preopen_msgattach_event(
+    path: Path,
+    source_kind: str,
+    source_event: str,
+    stat: os.stat_result,
+    now: float,
+) -> bool:
+    _ = stat
+    _ = now
+    event = str(source_event or "").strip().lower()
+    if source_kind not in DIRECT_MSGATTACH_SOURCE_KINDS:
+        return False
+    _ = path
+    return event == "created"
+
+
 def detect_source_kind(path: Path) -> str:
     s = str(path).lower().replace("/", "\\")
+    has_attach = "\\msgattach\\" in s or "\\msg\\attach\\" in s
+    has_image = "\\image\\" in s or "\\img\\" in s
+    has_thumb = "\\thumb\\" in s or "\\img\\" in s
+
+    if is_cache_image_temp_path(path):
+        return "cache_image_temp"
+
+    if has_attach and has_image and path.suffix.lower() == ".dat" and not path.name.lower().endswith("_t.dat"):
+        return "msgattach_image_dat"
+    if has_attach and has_thumb and path.suffix.lower() == ".dat" and path.name.lower().endswith("_t.dat"):
+        return "msgattach_thumb_dat"
+
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return "msgattach_image_dat"
     if "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
         return "msgattach_thumb_dat"
     if "\\filestorage\\temp\\" in s:
         return "temp_image"
-    if "\\msgattach\\" in s and "\\image\\" in s:
+    if has_attach and has_image:
         return "msgattach_image_plain"
     return "other"
 
@@ -236,6 +310,19 @@ def build_sink_row_values(row_payload: dict[str, Any]) -> list[Any]:
 def resolve_full_image_from_thumb_path(thumb_path: Path) -> Optional[Path]:
     """Try to map MsgAttach/Thumb/<month>/<hash>_t.dat -> MsgAttach/Image/<month>/<hash>.(dat|jpg|png...)."""
     s = str(thumb_path).replace("/", "\\")
+    
+    if "\\msg\\attach\\" in s.lower() and "\\img\\" in s.lower():
+        img_path = thumb_path
+        stem = img_path.stem
+        base = stem[:-2] if stem.lower().endswith("_t") else stem
+        candidates: list[Path] = []
+        for ext in (".dat", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"):
+            candidates.append(img_path.with_name(f"{base}{ext}"))
+        for c in candidates:
+            if c.exists() and c.is_file():
+                return c
+        return None
+
     if "\\msgattach\\" not in s.lower() or "\\thumb\\" not in s.lower():
         return None
 
@@ -258,6 +345,13 @@ def resolve_full_image_from_thumb_path(thumb_path: Path) -> Optional[Path]:
 
 def expected_full_image_from_thumb_path(thumb_path: Path) -> Optional[Path]:
     s = str(thumb_path).replace("/", "\\")
+    
+    if "\\msg\\attach\\" in s.lower() and "\\img\\" in s.lower():
+        img_path = thumb_path
+        stem = img_path.stem
+        base = stem[:-2] if stem.lower().endswith("_t") else stem
+        return img_path.with_name(f"{base}.dat")
+
     if "\\msgattach\\" not in s.lower() or "\\thumb\\" not in s.lower():
         return None
 
@@ -274,9 +368,127 @@ def sha256_bytes(data: bytes) -> str:
     return h.hexdigest()
 
 
+def find_wxgf_partitions(data: bytes) -> list[tuple[int, int, float]]:
+    if len(data) < 8 or data[:4] != b"wxgf":
+        return []
+
+    header_len = int(data[4])
+    if header_len >= len(data):
+        return []
+
+    for pattern in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
+        partitions: list[tuple[int, int, float]] = []
+        offset = 0
+        while header_len + offset <= len(data):
+            index = data.find(pattern, header_len + offset)
+            if index == -1:
+                break
+            if index < 4:
+                offset += 1
+                continue
+            size = int.from_bytes(data[index - 4:index], "big")
+            if size <= 0 or index + size > len(data):
+                offset = (index - header_len) + 1
+                continue
+            partitions.append((index, size, float(size) / float(len(data))))
+            offset = (index - header_len) + size
+        if partitions:
+            return partitions
+    return []
+
+
+def open_wxgf_image(data: bytes) -> tuple[Image.Image, bytes, str]:
+    if data[:4] != b"wxgf":
+        raise ValueError("Invalid wxgf payload")
+    if not OPENCV_AVAILABLE or cv2 is None:
+        detail = OPENCV_IMPORT_ERROR or "opencv unavailable"
+        raise ValueError(f"wxgf decoding requires OpenCV: {detail}")
+
+    partitions = find_wxgf_partitions(data)
+    if not partitions:
+        raise ValueError("wxgf partition not found")
+
+    offset, size, _ratio = max(partitions, key=lambda item: item[2])
+    hevc_stream = data[offset:offset + size]
+
+    temp_path: Optional[Path] = None
+    cap = None
+    try:
+        fd, raw_path = tempfile.mkstemp(suffix=".h265")
+        os.close(fd)
+        temp_path = Path(raw_path)
+        temp_path.write_bytes(hevc_stream)
+
+        cap = cv2.VideoCapture(str(temp_path))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise ValueError("OpenCV could not decode wxgf frame")
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb_frame).convert("RGB")
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=95)
+        return image, out.getvalue(), "jpg"
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def decode_wechat_dat(raw: bytes) -> tuple[bytes, str, int]:
     if len(raw) < 2:
         raise ValueError("Empty or invalid .dat file")
+
+    # V2 Format support
+    if raw.startswith(b'\x07\x08V2\x08\x07'):
+        import json
+        import struct
+        try:
+            with open("v2_keys.json", "r") as f:
+                keys = json.load(f)
+            aes_key = keys["image_aes_key"].encode("ascii")[:16]
+            xor_key_v2 = int(keys.get("image_xor_key", 0x88))
+            
+            from Crypto.Cipher import AES
+            from Crypto.Util import Padding
+            
+            aes_size, xor_size = struct.unpack_from('<LL', raw, 6)
+            aligned_aes_size = aes_size
+            aligned_aes_size -= ~(~aligned_aes_size % 16)
+            
+            offset = 15
+            aes_data = raw[offset:offset + aligned_aes_size]
+            cipher = AES.new(aes_key, AES.MODE_ECB)
+            dec_aes = Padding.unpad(cipher.decrypt(aes_data), AES.block_size)
+            offset += aligned_aes_size
+            
+            raw_data = raw[offset:len(raw) - xor_size]
+            offset += len(raw_data)
+            
+            xor_data = raw[offset:]
+            dec_xor = bytes(b ^ xor_key_v2 for b in xor_data)
+            
+            decoded = dec_aes + raw_data + dec_xor
+            
+            # Identify format
+            ext = "unknown"
+            if decoded[:3] == b'\xFF\xD8\xFF': ext = "jpg"
+            elif decoded[:4] == b'\x89PNG': ext = "png"
+            elif decoded[:4] == b'RIFF': ext = "webp"
+            elif decoded[:3] == b'GIF': ext = "gif"
+            elif decoded[:4] == b'wxgf': ext = "wxgf"
+             
+            return decoded, ext, xor_key_v2
+        except Exception as e:
+            print(f"V2 decode failed: {e}")
+            raise ValueError(f"Failed to decode V2 .dat file: {e}")
 
     for ext, (h0, h1) in IMG_HEADERS.items():
         k0 = raw[0] ^ h0
@@ -299,6 +511,9 @@ def open_image_from_file(path: Path) -> tuple[Image.Image, bytes, str, Optional[
     raw = path.read_bytes()
     if path.suffix.lower() == ".dat":
         decoded, ext, key = decode_wechat_dat(raw)
+        if decoded[:4] == b"wxgf" or ext == "wxgf":
+            image, normalized_bytes, normalized_ext = open_wxgf_image(decoded)
+            return image, normalized_bytes, normalized_ext, key
         with Image.open(io.BytesIO(decoded)) as im:
             return im.convert("RGB"), decoded, ext, key
     with Image.open(io.BytesIO(raw)) as im:
@@ -580,6 +795,18 @@ IGNORED_SENDER_USERNAMES = {
     "wxid_5sd4qzz1lyhl12",
     "jinshuo2004",
 }
+IGNORED_SENDER_DISPLAY_NAMES = {
+    "arthur shelby",
+    "mr shelby",
+    "judy",
+    "valentina爱拉👧🏻",
+}
+IGNORED_CLIENT_LABEL_MATCHES = {
+    "FECHAMENTO",
+    "IGNORE",
+    "IGNORAR",
+    "SKIP",
+}
 
 
 def normalize_text_for_match(value: str) -> str:
@@ -587,6 +814,13 @@ def normalize_text_for_match(value: str) -> str:
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = value.upper()
     value = re.sub(r"[^A-Z0-9]+", "", value)
+    return value
+
+
+def normalize_identity_for_match(value: Optional[str]) -> str:
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    value = value.casefold().strip()
+    value = re.sub(r"\s+", " ", value)
     return value
 
 
@@ -609,6 +843,8 @@ def normalize_client_label(value: Optional[str]) -> tuple[Optional[str], Optiona
 
     normalized = unicodedata.normalize("NFKC", label).upper().replace("—", "-")
     normalized_without_year = re.sub(r"\b2026\b", " ", normalized)
+    if normalize_text_for_match(normalized_without_year) in IGNORED_CLIENT_LABEL_MATCHES:
+        return (None, "IGNORED_CLIENT_LABEL_RULE")
     match = re.search(r"\d+(?:-\d+)*(?:[A-Z](?![A-Z]))?", normalized_without_year)
     if match:
         return (re.sub(r"[^A-Z0-9]", "", match.group(0)), None)
@@ -628,9 +864,15 @@ def normalize_client_label(value: Optional[str]) -> tuple[Optional[str], Optiona
 def should_ignore_sender(msg_ref: Optional["WeChatMessageRef"]) -> bool:
     if msg_ref is None:
         return False
-    sender = str(msg_ref.sender_user_name or "").strip().lower()
-    talker = str(msg_ref.talker or "").strip().lower()
-    return sender in IGNORED_SENDER_USERNAMES or talker in IGNORED_SENDER_USERNAMES
+    sender = normalize_identity_for_match(msg_ref.sender_user_name)
+    sender_display = normalize_identity_for_match(msg_ref.sender_display)
+    talker = normalize_identity_for_match(msg_ref.talker)
+    return (
+        sender in IGNORED_SENDER_USERNAMES
+        or talker in IGNORED_SENDER_USERNAMES
+        or sender_display in IGNORED_SENDER_DISPLAY_NAMES
+        or talker in IGNORED_SENDER_DISPLAY_NAMES
+    )
 
 
 def strip_accents(value: str) -> str:
@@ -1243,6 +1485,7 @@ class QueueItem:
     msg_create_time: float = 0.0
     manual_session_id: Optional[str] = None
     session_release_at: float = 0.0
+    open_seq: int = 0
 
 
 @dataclass
@@ -1287,7 +1530,141 @@ def extract_group_id_from_path(path: Path) -> Optional[str]:
     for idx, part in enumerate(parts):
         if part.lower() == "msgattach" and idx + 1 < len(parts):
             return parts[idx + 1]
+        
+        # xWeChat format: msg/attach/<hash>
+        if part.lower() == "msg" and idx + 2 < len(parts) and parts[idx+1].lower() == "attach":
+            return parts[idx + 2]
+
+        if part.lower() == "message" and idx + 1 < len(parts):
+            candidate = str(parts[idx + 1]).strip()
+            if re.fullmatch(r"[0-9a-f]{32}", candidate, re.IGNORECASE):
+                return candidate
+             
     return None
+
+
+def is_cache_image_temp_path(path: Path) -> bool:
+    parts = [str(part).strip().lower() for part in path.parts if str(part).strip()]
+    if "cache" not in parts:
+        return False
+    return "message" in parts and "imagetemp" in parts
+
+
+def is_cache_bubble_path(path: Path) -> bool:
+    parts = [str(part).strip().lower() for part in path.parts if str(part).strip()]
+    if "cache" not in parts:
+        return False
+    return "message" in parts and "bubble" in parts and str(path.name).strip().lower().endswith("_b.dat")
+
+
+def derive_cache_bubble_path_for_msgattach(path: Path) -> Optional[Path]:
+    try:
+        parts = list(path.parts)
+        lowered = [str(part).strip().lower() for part in parts]
+        idx = lowered.index("msg")
+        if idx + 4 >= len(parts) or lowered[idx + 1] != "attach":
+            return None
+        group_hash = str(parts[idx + 2]).strip()
+        month_token = str(parts[idx + 3]).strip()
+        if not group_hash or not month_token:
+            return None
+        account_root = Path(*parts[:idx])
+        stem = normalize_media_variant_stem(path)
+        if not stem:
+            return None
+        return account_root / "cache" / month_token / "Message" / group_hash / "Bubble" / f"{stem}_b.dat"
+    except Exception:
+        return None
+
+
+def derive_msgattach_paths_for_cache_bubble(path: Path) -> list[Path]:
+    try:
+        parts = list(path.parts)
+        lowered = [str(part).strip().lower() for part in parts]
+        idx = lowered.index("cache")
+        if idx + 4 >= len(parts) or lowered[idx + 2] != "message":
+            return []
+        month_token = str(parts[idx + 1]).strip()
+        group_hash = str(parts[idx + 3]).strip()
+        account_root = Path(*parts[:idx])
+        stem = normalize_media_variant_stem(path)
+        if not month_token or not group_hash or not stem:
+            return []
+        if stem.endswith("_b") and len(stem) > 2:
+            stem = stem[:-2]
+        if not stem:
+            return []
+        img_root = account_root / "msg" / "attach" / group_hash / month_token / "Img"
+        return [
+            img_root / f"{stem}.dat",
+            img_root / f"{stem}_h.dat",
+            img_root / f"{stem}_t.dat",
+        ]
+    except Exception:
+        return []
+
+
+def matching_msgattach_path_for_cache_bubble(path: Path) -> Optional[Path]:
+    for candidate in derive_msgattach_paths_for_cache_bubble(path):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def has_fresh_manual_bubble_context(
+    path: Path,
+    now: float,
+    freshness_seconds: int = MANUAL_BUBBLE_CONTEXT_MAX_AGE_SECONDS,
+    pair_mtime_delta_seconds: int = MANUAL_BUBBLE_PAIR_MTIME_DELTA_SECONDS,
+) -> bool:
+    bubble_path = derive_cache_bubble_path_for_msgattach(path)
+    if bubble_path is None or not bubble_path.exists():
+        return False
+    try:
+        file_stat = path.stat()
+        bubble_stat = bubble_path.stat()
+    except OSError:
+        return False
+    freshness = max(5, int(freshness_seconds))
+    pair_delta = max(1, int(pair_mtime_delta_seconds))
+    freshest_mtime = max(float(file_stat.st_mtime), float(bubble_stat.st_mtime))
+    if abs(float(file_stat.st_mtime) - float(bubble_stat.st_mtime)) > float(pair_delta):
+        return False
+    return max(0.0, float(now) - freshest_mtime) <= float(freshness)
+
+
+def normalize_media_variant_stem(path: Path) -> Optional[str]:
+    stem = str(path.stem or "").strip().lower()
+    if not stem:
+        return None
+    while True:
+        updated = False
+        for suffix in ("_h", "_t"):
+            if stem.endswith(suffix) and len(stem) > len(suffix):
+                stem = stem[:-len(suffix)]
+                updated = True
+                break
+        if not updated:
+            break
+    return stem or None
+
+
+def media_variant_scope_key(path: Path) -> Optional[str]:
+    parent_parts = [str(part).strip().lower() for part in path.parent.parts if str(part).strip()]
+    if not parent_parts:
+        return None
+    if parent_parts[-1] in {"img", "image", "thumb"}:
+        parent_parts = parent_parts[:-1]
+    scope = "\\".join(parent_parts).strip()
+    return scope or None
+
+
+def media_variant_key(path: Path) -> Optional[str]:
+    stem = normalize_media_variant_stem(path)
+    scope = media_variant_scope_key(path)
+    if not stem or not scope:
+        return None
+    return f"{scope}|{stem}"
 
 
 class ClientResolver:
@@ -1833,6 +2210,7 @@ class StateDB:
                     talker TEXT,
                     msg_create_time REAL,
                     manual_session_id TEXT,
+                    open_seq INTEGER NOT NULL DEFAULT 0,
                     session_release_at REAL NOT NULL DEFAULT 0,
                     processed_at REAL,
                     sha256 TEXT,
@@ -1866,6 +2244,7 @@ class StateDB:
                     talker TEXT,
                     msg_create_time REAL,
                     manual_session_id TEXT,
+                    open_seq INTEGER NOT NULL DEFAULT 0,
                     resolved_media_path TEXT,
                     resolution_source TEXT,
                     verification_status TEXT,
@@ -1907,6 +2286,16 @@ class StateDB:
                     range_seeded INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS manual_open_events (
+                    open_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    opened_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    claimed_at REAL,
+                    state TEXT NOT NULL,
+                    viewer_note TEXT,
+                    file_id TEXT,
+                    claimed_path TEXT
+                );
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -1937,20 +2326,25 @@ class StateDB:
             self._ensure_column_exists(cur, "files", "talker", "TEXT")
             self._ensure_column_exists(cur, "files", "msg_create_time", "REAL")
             self._ensure_column_exists(cur, "files", "manual_session_id", "TEXT")
+            self._ensure_column_exists(cur, "files", "open_seq", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column_exists(cur, "files", "session_release_at", "REAL NOT NULL DEFAULT 0")
             self._ensure_column_exists(cur, "message_jobs", "activation_seen_at", "REAL NOT NULL DEFAULT 0")
             self._ensure_column_exists(cur, "message_jobs", "manual_session_id", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "open_seq", "INTEGER NOT NULL DEFAULT 0")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sha256 ON receipts(sha256)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_msg_svr_id ON receipts(msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sheet_status_next ON receipts(sheet_status, sheet_next_attempt, msg_create_time)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_talker_msg_order ON receipts(talker, msg_create_time, msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_manual_session_order ON receipts(manual_session_id, talker, msg_create_time, msg_svr_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_open_seq ON receipts(open_seq, ingested_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_state_next ON message_jobs(state, next_ui_attempt_at, first_seen_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_talker_state ON message_jobs(talker, state, create_time DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_expected_path ON message_jobs(expected_image_path)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_manual_session ON message_jobs(manual_session_id, talker, create_time, msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_manual_session_order ON files(manual_session_id, talker, msg_create_time, next_attempt)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_open_seq ON files(open_seq, next_attempt, first_seen)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_manual_sessions_state_release ON manual_sessions(state, release_at, last_seen_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_manual_open_events_state_seq ON manual_open_events(state, open_seq, expires_at)")
             cur.execute(
                 """
                 UPDATE receipts
@@ -1997,6 +2391,7 @@ class StateDB:
         settle_seconds: int,
         source_event: str,
         thumb_candidates_enabled: bool,
+        manual_mode: bool = False,
     ) -> Optional[str]:
         if not is_candidate(path, thumb_candidates_enabled=thumb_candidates_enabled):
             return None
@@ -2008,11 +2403,38 @@ class StateDB:
             return None
 
         now = time.time()
-        file_id = self.compute_file_id(path, st)
         source_kind = detect_source_kind(path)
+        file_id = self.compute_file_id(path, st)
+        open_seq = 0
+        manual_open_bound = False
+        if manual_mode:
+            event_name = str(source_event or "").strip().lower()
+            if is_manual_open_source_kind(source_kind):
+                open_seq = self.claim_manual_open_event_for_candidate(file_id, path, now=now) or 0
+                if open_seq <= 0 and event_name in REALTIME_SOURCE_EVENTS:
+                    open_seq = self.create_manual_open_event(
+                        opened_at=now,
+                        viewer_note=f"synthetic:{source_kind}:{path.name}",
+                    )
+                    self.attach_manual_open_event(open_seq, file_id, path, now=now)
+            elif source_kind in DIRECT_MSGATTACH_SOURCE_KINDS:
+                open_seq = self.claim_manual_open_event_for_candidate(file_id, path, now=now) or 0
+                if open_seq <= 0 and has_fresh_manual_bubble_context(path, now):
+                    if event_name in REALTIME_SOURCE_EVENTS:
+                        open_seq = self.create_manual_open_event(
+                            opened_at=now,
+                            viewer_note=f"synthetic:bubble_match:{path.name}",
+                        )
+                        self.attach_manual_open_event(open_seq, file_id, path, now=now)
+            else:
+                return None
+            if open_seq <= 0:
+                return None
+            manual_open_bound = True
+        if should_ignore_preopen_msgattach_event(path, source_kind, source_event, st, now) and not manual_open_bound:
+            return None
         ext = path.suffix.lower()
         next_attempt = now + candidate_initial_delay_seconds(source_kind, settle_seconds, thumb_candidates_enabled)
-        refresh_manual_session = should_refresh_manual_session(source_kind, source_event)
         candidate_id: Optional[str] = None
 
         with self._lock:
@@ -2031,7 +2453,11 @@ class StateDB:
                 cur.execute(
                     """
                     UPDATE files
-                    SET last_seen=?, mtime=?, size=?, next_attempt=MIN(next_attempt, ?)
+                    SET last_seen=?, mtime=?, size=?, next_attempt=MIN(next_attempt, ?),
+                        open_seq=CASE
+                            WHEN ? > 0 AND (open_seq IS NULL OR open_seq <= 0) THEN ?
+                            ELSE COALESCE(open_seq, 0)
+                        END
                     WHERE file_id=?
                     """,
                     (
@@ -2039,6 +2465,8 @@ class StateDB:
                         float(st.st_mtime),
                         int(st.st_size),
                         float(next_attempt),
+                        int(open_seq),
+                        int(open_seq),
                         existing["file_id"],
                     ),
                 )
@@ -2047,12 +2475,20 @@ class StateDB:
             else:
                 cur.execute(
                     """
-                    INSERT INTO files(file_id, path, source_kind, ext, size, mtime, ctime, status, attempts, next_attempt, first_seen, last_seen)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                    INSERT INTO files(
+                        file_id, path, source_kind, ext, size, mtime, ctime, status,
+                        attempts, next_attempt, first_seen, last_seen, open_seq
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
                     ON CONFLICT(file_id) DO UPDATE SET
                         last_seen=excluded.last_seen,
                         mtime=excluded.mtime,
                         size=excluded.size,
+                        open_seq=CASE
+                            WHEN COALESCE(excluded.open_seq, 0) > 0 AND COALESCE(files.open_seq, 0) <= 0
+                                THEN excluded.open_seq
+                            ELSE COALESCE(files.open_seq, 0)
+                        END,
                         next_attempt=CASE
                             WHEN files.status IN ('done', 'duplicate') THEN files.next_attempt
                             ELSE MIN(files.next_attempt, excluded.next_attempt)
@@ -2069,13 +2505,12 @@ class StateDB:
                         float(next_attempt),
                         float(now),
                         float(now),
+                        int(open_seq),
                     ),
                 )
                 self._conn.commit()
                 candidate_id = file_id
 
-        if refresh_manual_session:
-            self.start_manual_session(now)
         return candidate_id
 
     def get_file(self, file_id: Optional[str]) -> Optional[sqlite3.Row]:
@@ -2454,6 +2889,191 @@ class StateDB:
         self.set_meta(MANUAL_SESSION_META_KEY, f"{ts:.6f}")
         return ts
 
+    def clear_manual_session_started_at(self) -> None:
+        self.set_meta(MANUAL_SESSION_META_KEY, "0")
+        self.set_meta(MANUAL_SESSION_ID_META_KEY, "")
+
+    def expire_manual_open_events(self, now: Optional[float] = None) -> int:
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                UPDATE manual_open_events
+                SET state=?,
+                    claimed_at=CASE WHEN claimed_at IS NULL THEN ? ELSE claimed_at END
+                WHERE state=?
+                  AND expires_at <= ?
+                """,
+                (
+                    MANUAL_OPEN_EVENT_EXPIRED_STATE,
+                    float(moment),
+                    MANUAL_OPEN_EVENT_PENDING_STATE,
+                    float(moment),
+                ),
+            )
+            changed = int(cur.rowcount or 0)
+            self._conn.commit()
+            return changed
+
+    def create_manual_open_event(
+        self,
+        opened_at: Optional[float] = None,
+        expires_at: Optional[float] = None,
+        viewer_note: str = "",
+    ) -> int:
+        moment = time.time() if opened_at is None else float(opened_at)
+        expiry = float(expires_at) if expires_at is not None else (moment + float(MANUAL_VIEWER_EVENT_WINDOW_SECONDS))
+        note = str(viewer_note or "").strip()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                UPDATE manual_open_events
+                SET state=?,
+                    claimed_at=CASE WHEN claimed_at IS NULL THEN ? ELSE claimed_at END
+                WHERE state=?
+                  AND expires_at <= ?
+                """,
+                (
+                    MANUAL_OPEN_EVENT_EXPIRED_STATE,
+                    float(moment),
+                    MANUAL_OPEN_EVENT_PENDING_STATE,
+                    float(moment),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO manual_open_events(opened_at, expires_at, claimed_at, state, viewer_note, file_id, claimed_path)
+                VALUES(?, ?, NULL, ?, ?, NULL, NULL)
+                """,
+                (
+                    float(moment),
+                    float(expiry),
+                    MANUAL_OPEN_EVENT_PENDING_STATE,
+                    note[:1200],
+                ),
+            )
+            open_seq = int(cur.lastrowid or 0)
+            cur.execute(
+                """
+                INSERT INTO meta(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (MANUAL_SESSION_META_KEY, f"{float(moment):.6f}", float(moment)),
+            )
+            cur.execute(
+                """
+                INSERT INTO meta(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (MANUAL_SESSION_ID_META_KEY, "", float(moment)),
+            )
+            self._conn.commit()
+            return open_seq
+
+    def claim_manual_open_event_for_candidate(
+        self,
+        file_id: str,
+        path: Path,
+        now: Optional[float] = None,
+    ) -> Optional[int]:
+        moment = time.time() if now is None else float(now)
+        file_id_value = str(file_id or "").strip()
+        path_value = str(path or "").strip()
+        if not file_id_value or not path_value:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                UPDATE manual_open_events
+                SET state=?,
+                    claimed_at=CASE WHEN claimed_at IS NULL THEN ? ELSE claimed_at END
+                WHERE state=?
+                  AND expires_at <= ?
+                """,
+                (
+                    MANUAL_OPEN_EVENT_EXPIRED_STATE,
+                    float(moment),
+                    MANUAL_OPEN_EVENT_PENDING_STATE,
+                    float(moment),
+                ),
+            )
+            row = cur.execute(
+                """
+                SELECT open_seq
+                FROM manual_open_events
+                WHERE state=?
+                  AND expires_at > ?
+                ORDER BY open_seq ASC
+                LIMIT 1
+                """,
+                (MANUAL_OPEN_EVENT_PENDING_STATE, float(moment)),
+            ).fetchone()
+            if row is None:
+                self._conn.commit()
+                return None
+            open_seq = int(row["open_seq"] or 0)
+            cur.execute(
+                """
+                UPDATE manual_open_events
+                SET state=?,
+                    claimed_at=?,
+                    file_id=?,
+                    claimed_path=?
+                WHERE open_seq=?
+                  AND state=?
+                """,
+                (
+                    MANUAL_OPEN_EVENT_CLAIMED_STATE,
+                    float(moment),
+                    file_id_value,
+                    path_value[:1200],
+                    int(open_seq),
+                    MANUAL_OPEN_EVENT_PENDING_STATE,
+                ),
+            )
+            claimed = int(cur.rowcount or 0)
+            self._conn.commit()
+            return open_seq if claimed else None
+
+    def attach_manual_open_event(
+        self,
+        open_seq: int,
+        file_id: str,
+        path: Path,
+        now: Optional[float] = None,
+    ) -> None:
+        moment = time.time() if now is None else float(now)
+        file_id_value = str(file_id or "").strip()
+        path_value = str(path or "").strip()
+        if int(open_seq or 0) <= 0 or not file_id_value or not path_value:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE manual_open_events
+                SET state=?,
+                    claimed_at=?,
+                    file_id=?,
+                    claimed_path=?
+                WHERE open_seq=?
+                """,
+                (
+                    MANUAL_OPEN_EVENT_CLAIMED_STATE,
+                    float(moment),
+                    file_id_value,
+                    path_value[:1200],
+                    int(open_seq),
+                ),
+            )
+            self._conn.commit()
+
     @staticmethod
     def _parse_bool_text(value: Any, default: bool = False) -> bool:
         if value is None:
@@ -2729,12 +3349,20 @@ class StateDB:
             row = cur.execute(
                 """
                 SELECT f.file_id, f.path, f.source_kind, f.ext, f.size, f.mtime, f.first_seen, f.attempts,
-                       f.msg_svr_id, f.talker, f.msg_create_time, f.manual_session_id, f.session_release_at
+                       f.msg_svr_id, f.talker, f.msg_create_time, f.manual_session_id, f.session_release_at,
+                       COALESCE(f.open_seq, 0) AS open_seq
                 FROM files AS f
                 WHERE f.status IN ('pending', 'retry')
                   AND f.next_attempt <= ?
                   AND COALESCE(f.session_release_at, 0) <= ?
                 ORDER BY
+                    CASE
+                        WHEN COALESCE(f.open_seq, 0) > 0 THEN 0
+                        ELSE 1
+                    END ASC,
+                    CASE
+                        WHEN COALESCE(f.open_seq, 0) > 0 THEN COALESCE(f.open_seq, 0)
+                    END ASC,
                     CASE
                         WHEN ? <> '' AND COALESCE(f.manual_session_id, '') = ? THEN 0
                         WHEN ? <> '' THEN 1
@@ -2755,8 +3383,22 @@ class StateDB:
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN 0 ELSE 1 END ASC,
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_create_time END ASC,
                     CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_svr_id END ASC,
-                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.first_seen END ASC,
-                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.mtime END ASC,
+                    CASE
+                        WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN
+                            CASE
+                                WHEN f.source_kind IN ('msgattach_image_dat', 'msgattach_image_plain', 'msgattach_thumb_dat', 'temp_image')
+                                    THEN -COALESCE(f.first_seen, 0)
+                                ELSE COALESCE(f.first_seen, 0)
+                            END
+                    END ASC,
+                    CASE
+                        WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN
+                            CASE
+                                WHEN f.source_kind IN ('msgattach_image_dat', 'msgattach_image_plain', 'msgattach_thumb_dat', 'temp_image')
+                                    THEN -COALESCE(f.mtime, 0)
+                                ELSE COALESCE(f.mtime, 0)
+                            END
+                    END ASC,
                     f.next_attempt ASC
                 LIMIT 1
                 """,
@@ -2798,6 +3440,7 @@ class StateDB:
                 msg_create_time=float(row["msg_create_time"] or 0.0),
                 manual_session_id=str(row["manual_session_id"] or "").strip() or None,
                 session_release_at=float(row["session_release_at"] or 0.0),
+                open_seq=int(row["open_seq"] or 0),
             )
 
     def mark_done(self, file_id: str, sha256: str, processed_at: float, note: Optional[str] = None) -> None:
@@ -2811,6 +3454,132 @@ class StateDB:
                 (processed_at, sha256, note[:1200] if note else None, file_id),
             )
             self._conn.commit()
+
+    def find_receipt_by_media_variant(self, source_path: Path | str, limit: int = 4000) -> Optional[sqlite3.Row]:
+        variant_key = media_variant_key(Path(source_path))
+        if not variant_key:
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT file_id, source_path, ingested_at, client, txn_date, txn_time, amount
+                FROM receipts
+                ORDER BY ingested_at DESC
+                LIMIT ?
+                """,
+                (int(max(1, limit)),),
+            ).fetchall()
+        for row in rows:
+            existing_path = str(row["source_path"] or "").strip()
+            if not existing_path:
+                continue
+            if media_variant_key(Path(existing_path)) == variant_key:
+                return row
+        return None
+
+    def resolve_related_media_variants(
+        self,
+        source_path: Path | str,
+        exclude_file_id: str,
+        sha256: str = "",
+        reason: str = "RESOLVED_BY_MEDIA_VARIANT",
+    ) -> int:
+        variant_key = media_variant_key(Path(source_path))
+        if not variant_key:
+            return 0
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT file_id, path
+                FROM files
+                WHERE file_id<>?
+                  AND status IN ('pending', 'retry', 'processing', 'exception')
+                """,
+                (str(exclude_file_id),),
+            ).fetchall()
+            matching_ids = [
+                str(row["file_id"])
+                for row in rows
+                if media_variant_key(Path(str(row["path"] or "").strip())) == variant_key
+            ]
+            if not matching_ids:
+                return 0
+            self._conn.executemany(
+                """
+                UPDATE files
+                SET status='done',
+                    processed_at=?,
+                    sha256=CASE WHEN sha256 IS NULL OR sha256='' THEN ? ELSE sha256 END,
+                    last_error=?
+                WHERE file_id=?
+                """,
+                [
+                    (float(now), sha256, reason[:1200], file_id)
+                    for file_id in matching_ids
+                ],
+            )
+            self._conn.commit()
+            return len(matching_ids)
+
+    def suppress_conversation_burst(
+        self,
+        source_path: Path | str,
+        center_first_seen: float,
+        window_sec: int = CONVERSATION_BURST_WINDOW_SECONDS,
+        variant_threshold: int = CONVERSATION_BURST_VARIANT_THRESHOLD,
+        reason: str = "IGNORED_CONVERSATION_BURST",
+    ) -> tuple[int, int]:
+        scope_key = media_variant_scope_key(Path(source_path))
+        if not scope_key:
+            return (0, 0)
+        window = max(1, int(window_sec))
+        lower_bound = float(center_first_seen) - float(window)
+        upper_bound = float(center_first_seen) + float(window)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT file_id, path, source_kind
+                FROM files
+                WHERE status IN ('pending', 'retry', 'processing', 'exception')
+                  AND first_seen BETWEEN ? AND ?
+                """,
+                (float(lower_bound), float(upper_bound)),
+            ).fetchall()
+            matched_ids: list[str] = []
+            variant_keys: set[str] = set()
+            for row in rows:
+                source_kind = str(row["source_kind"] or "").strip()
+                if source_kind not in DIRECT_MSGATTACH_SOURCE_KINDS:
+                    continue
+                path_value = str(row["path"] or "").strip()
+                if not path_value:
+                    continue
+                path_obj = Path(path_value)
+                if media_variant_scope_key(path_obj) != scope_key:
+                    continue
+                variant_key = media_variant_key(path_obj)
+                if variant_key:
+                    variant_keys.add(variant_key)
+                matched_ids.append(str(row["file_id"]))
+            if len(variant_keys) < max(2, int(variant_threshold)) or not matched_ids:
+                return (0, len(variant_keys))
+            now = time.time()
+            self._conn.executemany(
+                """
+                UPDATE files
+                SET status='done',
+                    processed_at=?,
+                    last_error=?
+                WHERE file_id=?
+                """,
+                [
+                    (float(now), reason[:1200], file_id)
+                    for file_id in matched_ids
+                ],
+            )
+            self._conn.commit()
+            return (len(matched_ids), len(variant_keys))
 
     def resolve_related_file_paths(
         self,
@@ -3102,12 +3871,13 @@ class StateDB:
                     txn_date, txn_time, client, bank, beneficiary, amount, currency,
                     parse_conf, quality_score, ocr_engine, ocr_conf, ocr_chars,
                     review_needed, ocr_text, parser_json, msg_svr_id, talker, msg_create_time, manual_session_id,
+                    open_seq,
                     resolved_media_path, resolution_source, verification_status,
                     txn_date_source, txn_time_source, amount_raw, amount_rounded, amount_source,
                     sheet_status, sheet_payload_json, sheet_next_attempt, sheet_last_error, sheet_committed_at,
                     excel_sheet, excel_row
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     payload["file_id"],
@@ -3134,6 +3904,7 @@ class StateDB:
                     payload.get("talker"),
                     payload.get("msg_create_time"),
                     payload.get("manual_session_id"),
+                    int(payload.get("open_seq") or 0),
                     payload.get("resolved_media_path"),
                     payload.get("resolution_source"),
                     payload.get("verification_status"),
@@ -3232,7 +4003,8 @@ class StateDB:
             rows = cur.execute(
                 f"""
                 SELECT r.file_id, r.source_path, r.ingested_at, r.review_needed, r.msg_svr_id, r.talker,
-                       r.msg_create_time, r.manual_session_id, r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
+                       r.msg_create_time, r.manual_session_id, COALESCE(r.open_seq, 0) AS open_seq,
+                       r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
                        r.sheet_payload_json, r.sheet_status, f.first_seen AS source_first_seen
                 FROM receipts AS r
                 LEFT JOIN files AS f
@@ -3240,6 +4012,13 @@ class StateDB:
                 WHERE COALESCE(r.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
                   AND COALESCE(r.sheet_next_attempt, 0) <= ?
                 ORDER BY
+                    CASE
+                        WHEN COALESCE(r.open_seq, 0) > 0 THEN 0
+                        ELSE 1
+                    END ASC,
+                    CASE
+                        WHEN COALESCE(r.open_seq, 0) > 0 THEN COALESCE(r.open_seq, 0)
+                    END ASC,
                     CASE
                         WHEN ? <> '' AND COALESCE(r.manual_session_id, '') = ? THEN 0
                         WHEN ? <> '' THEN 1
@@ -3275,8 +4054,9 @@ class StateDB:
                 talker = str(row["talker"] or "").strip() or None
                 msg_create_time = float(row["msg_create_time"] or 0.0)
                 receipt_session_id = str(row["manual_session_id"] or "").strip() or None
+                open_seq = int(row["open_seq"] or 0)
                 blocker_note: Optional[str] = None
-                if scope == "per_talker" and talker and msg_create_time > 0:
+                if scope == "per_talker" and talker and msg_create_time > 0 and open_seq <= 0:
                     prior_sink = self.find_prior_pending_sink_receipt(
                         talker=talker,
                         msg_create_time=msg_create_time,
@@ -3349,6 +4129,7 @@ class StateDB:
                     "talker": talker,
                     "msg_create_time": msg_create_time,
                     "manual_session_id": receipt_session_id,
+                    "open_seq": open_seq,
                     "row_payload": payload,
                 }
 
@@ -4222,29 +5003,53 @@ class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
         self.cfg = cfg
         self.media_resolver = media_resolver
 
+    def _upsert_event_path(self, path: Path, source_event: str, manual_mode: bool) -> Optional[str]:
+        file_id = self.db.upsert_candidate(
+            path,
+            self.cfg.settle_seconds,
+            source_event,
+            thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
+            manual_mode=manual_mode,
+        )
+        if file_id is not None and not manual_mode:
+            preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, path, source_event)
+        return file_id
+
+    def _trigger_manual_bubble_pair(self, bubble_path: Path, source_event: str, manual_mode: bool) -> Optional[str]:
+        if not manual_mode or not is_cache_bubble_path(bubble_path):
+            return None
+        paired_path = matching_msgattach_path_for_cache_bubble(bubble_path)
+        if paired_path is None:
+            return None
+        open_seq = self.db.create_manual_open_event(
+            opened_at=time.time(),
+            viewer_note=f"synthetic:cache_bubble:{bubble_path.name}",
+        )
+        file_id = self._upsert_event_path(paired_path, source_event, manual_mode=True)
+        if file_id is not None:
+            print(
+                f"[MANUAL] bubble_trigger | bubble={bubble_path.name} "
+                f"| media={paired_path.name} | open_seq={open_seq}"
+            )
+        return file_id
+
     def on_created(self, event: Any) -> None:
         if event.is_directory:
             return
-        file_id = self.db.upsert_candidate(
-            Path(event.src_path),
-            self.cfg.settle_seconds,
-            "created",
-            thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
-        )
-        if file_id is not None:
-            preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, Path(event.src_path), "created")
+        manual_mode = not self.db.is_ui_force_runtime_enabled(default_enabled=self.cfg.ui_force_download_enabled)
+        path = Path(event.src_path)
+        file_id = self._upsert_event_path(path, "created", manual_mode)
+        if file_id is None:
+            self._trigger_manual_bubble_pair(path, "created", manual_mode)
 
     def on_modified(self, event: Any) -> None:
         if event.is_directory:
             return
-        file_id = self.db.upsert_candidate(
-            Path(event.src_path),
-            self.cfg.settle_seconds,
-            "modified",
-            thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
-        )
-        if file_id is not None:
-            preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, Path(event.src_path), "modified")
+        manual_mode = not self.db.is_ui_force_runtime_enabled(default_enabled=self.cfg.ui_force_download_enabled)
+        path = Path(event.src_path)
+        file_id = self._upsert_event_path(path, "modified", manual_mode)
+        if file_id is None:
+            self._trigger_manual_bubble_pair(path, "modified", manual_mode)
 
 
 @dataclass
@@ -4293,8 +5098,11 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
     count = 0
     now = time.time()
     overlap_sec = max(60.0, float(cfg.settle_seconds * 3))
-    fallback_floor = now - max(1, cfg.recent_files_hours) * 3600
     previous_watermark = db.get_meta_float("reconcile_watermark")
+    if cfg.recent_files_hours <= 0:
+        db.set_meta("reconcile_watermark", f"{now:.6f}")
+        return 0
+    fallback_floor = now - max(0, cfg.recent_files_hours) * 3600
     scan_floor = max(0.0, fallback_floor if previous_watermark is None else previous_watermark - overlap_sec)
     newest_mtime = previous_watermark or 0.0
     for root in cfg.watch_roots:
@@ -4316,6 +5124,7 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
                 cfg.settle_seconds,
                 "reconcile",
                 thumb_candidates_enabled=cfg.thumb_candidates_enabled,
+                manual_mode=not db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled),
             ):
                 count += 1
             newest_mtime = max(newest_mtime, float(st.st_mtime))
@@ -4625,6 +5434,7 @@ class UIForceDownloadWorker(threading.Thread):
                                 settle_seconds=1,
                                 source_event="ui-force",
                                 thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
+                                manual_mode=False,
                             )
                             if file_id is not None:
                                 preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, resolved_path, "ui-force")
@@ -4634,6 +5444,7 @@ class UIForceDownloadWorker(threading.Thread):
                                 settle_seconds=1,
                                 source_event="ui-force",
                                 thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
+                                manual_mode=False,
                             )
                             if file_id is not None:
                                 preregister_manual_order_candidate(self.db, self.media_resolver, self.cfg, file_id, candidate.expected_image_path, "ui-force")
@@ -4642,6 +5453,63 @@ class UIForceDownloadWorker(threading.Thread):
                 self.db.set_meta("last_ui_result", note)
                 print(f"[UI] failed | talker={last_talker} | err={note}")
                 self.db.finish_ui_batch(batch_id, [], note, self.cfg.ui_retry_backoff_seconds)
+
+
+class ManualViewerOpenWorker(threading.Thread):
+    def __init__(self, db: StateDB, cfg: Config, stop_event: threading.Event) -> None:
+        super().__init__(name="wechat-manual-viewer-open", daemon=True)
+        self.db = db
+        self.cfg = cfg
+        self.stop_event = stop_event
+        self.available = UI_FORCE_DOWNLOADER_AVAILABLE and WeChatUIForceDownloader is not None
+        self.unavailable_reason = None if self.available else (UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable")
+        self._downloader = (
+            WeChatUIForceDownloader(
+                focus_policy=cfg.ui_focus_policy,
+                item_timeout_seconds=cfg.ui_item_timeout_seconds,
+                window_backends=cfg.ui_window_backends,
+                window_class_candidates=cfg.ui_window_classes,
+            )
+            if self.available
+            else None
+        )
+
+    def run(self) -> None:
+        if not self.available or self._downloader is None:
+            return
+
+        last_open = False
+        last_handle: Optional[int] = None
+        while not self.stop_event.is_set():
+            runtime_enabled = self.db.is_ui_force_runtime_enabled(default_enabled=self.cfg.ui_force_download_enabled)
+            if runtime_enabled:
+                last_open = False
+                last_handle = None
+                self.stop_event.wait(max(0.5, self.cfg.idle_sleep_seconds))
+                continue
+
+            try:
+                self.db.expire_manual_open_events()
+                opened, viewer_handle, note = self._downloader.probe_viewer_window()
+            except Exception as exc:
+                note = f"manual_viewer_probe_failed:{type(exc).__name__}:{exc}"
+                self.db.set_meta("last_manual_open_probe", note)
+                self.stop_event.wait(max(0.5, MANUAL_VIEWER_POLL_SECONDS))
+                continue
+
+            if opened and (not last_open or viewer_handle != last_handle):
+                open_seq = self.db.create_manual_open_event(viewer_note=note)
+                self.db.set_meta("last_manual_open_probe", f"open_seq={open_seq}|{note}")
+                print(f"[MANUAL] viewer_open | open_seq={open_seq} | note={note}")
+                last_open = True
+                last_handle = viewer_handle
+            elif not opened:
+                if last_open:
+                    self.db.set_meta("last_manual_open_probe", f"viewer_closed|last_handle={last_handle or 0}")
+                last_open = False
+                last_handle = None
+
+            self.stop_event.wait(max(0.05, MANUAL_VIEWER_POLL_SECONDS))
 
 
 def has_core_signal(fields: dict[str, Any], bank: Optional[str]) -> bool:
@@ -4691,6 +5559,40 @@ def resolve_media_candidate(
     manual_materialization_mode = not ui_force_runtime_enabled
     manual_session_started_at = db.get_manual_session_started_at() if manual_materialization_mode else None
     manual_session_id = item.manual_session_id
+
+    if original_source_kind == "cache_image_temp":
+        group_hash = extract_group_id_from_path(original_path)
+        msg_ref: Optional[WeChatMessageRef] = None
+        if media_resolver is not None and group_hash:
+            msg_ref = media_resolver.find_unique_message_for_group(
+                group_hash,
+                item.mtime,
+                max(cfg.original_wait_seconds * 4, 1800),
+            )
+        client_source_path = msg_ref.preferred_context_path() if msg_ref is not None else original_path
+        if msg_ref is not None:
+            ensure_message_job_tracking(
+                db=db,
+                resolver=resolver,
+                media_resolver=media_resolver,
+                cfg=cfg,
+                msg_ref=msg_ref,
+                thumb_path=msg_ref.thumb_abs_path,
+                client_source_path=client_source_path,
+                first_seen_at=item.first_seen,
+                manual_session_id=manual_session_id,
+            )
+        return MediaResolution(
+            original_source_path=original_path,
+            original_source_kind=original_source_kind,
+            resolved_path=original_path,
+            resolved_source_kind=original_source_kind,
+            client_source_path=client_source_path,
+            resolution_source="viewer_image_temp",
+            verification_status="CONFIRMADO",
+            msg_ref=msg_ref,
+            using_thumb_fallback=False,
+        )
 
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
@@ -4968,6 +5870,7 @@ def process_item(
     path = Path(item.path)
     resolution: Optional[MediaResolution] = None
     msg_svr_id: Optional[str] = None
+    direct_variant_source_path: Optional[Path] = None
     active_media_resolver = runtime_media_resolver(media_resolver)
     try:
         resolution = resolve_media_candidate(
@@ -5019,9 +5922,33 @@ def process_item(
         client = resolver.resolve(resolution.client_source_path)
         if not client:
             gid = extract_group_id_from_path(resolution.client_source_path) or "SEM_GRUPO"
-            db.mark_hold(item.file_id, reason=f"MISSING_CLIENT_MAP:{gid}", delay_sec=120)
-            print(f"[HOLD] {path.name} | grupo_sem_mapa={gid}")
-            return
+            # Use group hash as client name so images are not blocked
+            client = gid
+            print(f"[INFO] {path.name} | grupo_sem_mapa={gid} | usando_hash_como_cliente")
+
+        if resolution.original_source_kind in DIRECT_MSGATTACH_SOURCE_KINDS:
+            direct_variant_source_path = resolution.original_source_path
+        elif resolution.resolved_source_kind in DIRECT_MSGATTACH_SOURCE_KINDS:
+            direct_variant_source_path = path
+        if direct_variant_source_path is not None:
+            suppressed_files, suppressed_variants = db.suppress_conversation_burst(
+                source_path=direct_variant_source_path,
+                center_first_seen=item.first_seen,
+            )
+            if suppressed_files:
+                db.mark_message_job_resolved(msg_svr_id, note="IGNORED_CONVERSATION_BURST")
+                print(
+                    f"[SKIP] {path.name} | ignored_conversation_burst "
+                    f"| variants={suppressed_variants} | files={suppressed_files}"
+                )
+                return
+            existing_variant = db.find_receipt_by_media_variant(direct_variant_source_path)
+            if existing_variant is not None:
+                existing_variant_path = Path(str(existing_variant["source_path"] or "").strip() or str(direct_variant_source_path))
+                db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="DUPLICATE_MEDIA_VARIANT")
+                db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_MEDIA_VARIANT")
+                print(f"[SKIP] {path.name} | duplicate_media_variant={existing_variant_path.name}")
+                return
 
         open_started_at = time.perf_counter()
         img, img_bytes, _ext, _key = open_image_from_file(path)
@@ -5102,6 +6029,7 @@ def process_item(
             "talker": resolution.msg_ref.talker if resolution.msg_ref is not None else None,
             "msg_create_time": resolution.msg_ref.create_time if resolution.msg_ref is not None else None,
             "manual_session_id": item.manual_session_id,
+            "open_seq": int(item.open_seq or 0),
             "resolved_media_path": str(path),
             "resolution_source": resolution.resolution_source,
             "verification_status": resolution.verification_status,
@@ -5117,6 +6045,12 @@ def process_item(
         payload["excel_row"] = None
         db.insert_receipt(payload)
         db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
+        if direct_variant_source_path is not None:
+            db.resolve_related_media_variants(
+                source_path=direct_variant_source_path,
+                exclude_file_id=item.file_id,
+                sha256=digest,
+            )
         db.resolve_related_file_paths(
             source_path=resolution.original_source_path,
             exclude_file_id=item.file_id,
@@ -5401,6 +6335,8 @@ def ensure_client_map_file(map_path: Path, watch_roots: list[Path]) -> None:
     for root in watch_roots:
         msgattach = root / "MsgAttach"
         if not msgattach.exists():
+            msgattach = root / "msg" / "attach"
+        if not msgattach.exists():
             continue
         for sub in msgattach.iterdir():
             if not sub.is_dir():
@@ -5456,7 +6392,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ui-item-timeout-seconds", type=int, default=int(os.getenv("WECHAT_UI_ITEM_TIMEOUT_SECONDS", "5")))
     p.add_argument("--ui-retry-backoff-seconds", default=os.getenv("WECHAT_UI_RETRY_BACKOFF_SECONDS", "5,10,20,40"))
     p.add_argument("--ui-window-backends", default=os.getenv("WECHAT_UI_WINDOW_BACKENDS", "win32,uia"))
-    p.add_argument("--ui-window-classes", default=os.getenv("WECHAT_UI_WINDOW_CLASSES", "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_0"))
+    p.add_argument("--ui-window-classes", default=os.getenv("WECHAT_UI_WINDOW_CLASSES", "WeChatMainWndForPC,mmui::MainWindow,Qt51514QWindowIcon,Base_PowerMessageWindow,Chrome_WidgetWin_0"))
     p.add_argument("--sheet-order-scope", default=os.getenv("WECHAT_SHEET_ORDER_SCOPE", "per_talker"))
     p.add_argument("--sheet-materialization-order", default=os.getenv("WECHAT_SHEET_MATERIALIZATION_ORDER", "desc"))
     p.add_argument("--sheet-commit-order", default=os.getenv("WECHAT_SHEET_COMMIT_ORDER", "asc"))
@@ -5481,7 +6417,7 @@ def build_config(args: argparse.Namespace) -> Config:
         resolution_mode=(str(args.resolution_mode).strip().lower() or "db-first"),
         settle_seconds=max(1, args.settle_seconds),
         reconcile_seconds=max(20, args.reconcile_seconds),
-        recent_files_hours=max(1, int(args.recent_files_hours)),
+        recent_files_hours=max(0, int(args.recent_files_hours)),
         idle_sleep_seconds=max(0.2, args.idle_sleep_seconds),
         retry_base_seconds=max(10, args.retry_base_seconds),
         min_confidence=max(0.0, min(1.0, args.min_confidence)),
@@ -5502,7 +6438,7 @@ def build_config(args: argparse.Namespace) -> Config:
         ui_window_backends=[token.lower() for token in parse_token_list(args.ui_window_backends, ["win32", "uia"])],
         ui_window_classes=parse_token_list(
             args.ui_window_classes,
-            ["WeChatMainWndForPC", "Base_PowerMessageWindow", "Chrome_WidgetWin_0"],
+            ["WeChatMainWndForPC", "mmui::MainWindow", "Qt51514QWindowIcon", "Base_PowerMessageWindow", "Chrome_WidgetWin_0"],
         ),
         sheet_order_scope=(str(args.sheet_order_scope).strip().lower() or "per_talker"),
         sheet_materialization_order=(str(args.sheet_materialization_order).strip().lower() or "desc"),
@@ -5577,6 +6513,11 @@ def main() -> int:
     print(f"Sheet order scope: {cfg.sheet_order_scope}")
     print(f"Sheet materialization order: {cfg.sheet_materialization_order}")
     print(f"Sheet commit order: {cfg.sheet_commit_order}")
+    manual_mode_default = not cfg.ui_force_download_enabled
+    if manual_mode_default and not cfg.manual_order_guard_enabled:
+        print("Manual mode requires --manual-order-guard-enabled true.")
+        return 6
+
     if cfg.ui_force_download_enabled:
         if not UI_FORCE_DOWNLOADER_AVAILABLE or WeChatUIForceDownloader is None:
             err = UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable"
@@ -5602,6 +6543,12 @@ def main() -> int:
     media_resolver: Optional[WeChatDBResolver] = None
     if cfg.resolution_mode == "db-first":
         media_resolver = WeChatDBResolver(cfg.watch_roots, cfg.db_merge_path, refresh_seconds=10)
+        if not media_resolver.available:
+            print(f"WeChat DB resolver: required_but_unavailable | err={media_resolver.last_error or 'unknown'}")
+            return 7
+        if not media_resolver.refresh_if_due(force=True):
+            print(f"WeChat DB resolver: required_merge_failed | err={media_resolver.last_error or 'unknown'}")
+            return 7
 
     db = StateDB(cfg.db_path)
     if cfg.ui_force_download_enabled:
@@ -5609,7 +6556,7 @@ def main() -> int:
             db.set_ui_force_runtime_enabled(True, release_waiting=False)
     else:
         db.set_ui_force_runtime_enabled(False, release_waiting=False)
-        db.start_manual_session()
+        db.clear_manual_session_started_at()
     if not cfg.thumb_candidates_enabled:
         ignored_manual_open_only = db.ignore_manual_open_only_waits()
         if ignored_manual_open_only:
@@ -5651,10 +6598,7 @@ def main() -> int:
             f"Google Sheets: {label} | main={main_sheet} | review={review_sheet} | auth={sink.auth_mode}"
         )
     if media_resolver is not None:
-        if media_resolver.refresh_if_due(force=True):
-            print(f"WeChat DB resolver: enabled | wx_dir={media_resolver.selected_wx_dir} | merge={cfg.db_merge_path}")
-        else:
-            print(f"WeChat DB resolver: degraded_to_path_only | err={media_resolver.last_error or 'unknown'}")
+        print(f"WeChat DB resolver: enabled | wx_dir={media_resolver.selected_wx_dir} | merge={cfg.db_merge_path}")
     print(f"UI force runtime enabled: {db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)}")
 
     requeued = db.requeue_mapped_missing_client(resolver, max_age_hours=3, limit=1200)
@@ -5692,6 +6636,7 @@ def main() -> int:
 
     stop_event = threading.Event()
     ui_worker: Optional[UIForceDownloadWorker] = None
+    manual_viewer_worker: Optional[ManualViewerOpenWorker] = None
     if cfg.ui_force_download_enabled and cfg.resolution_mode == "db-first":
         ui_worker = UIForceDownloadWorker(db=db, cfg=cfg, stop_event=stop_event, media_resolver=media_resolver)
         if ui_worker.available:
@@ -5701,6 +6646,24 @@ def main() -> int:
             print(f"UI force download worker: unavailable | err={ui_worker.unavailable_reason}")
     else:
         print("UI force download worker: disabled")
+
+    if manual_mode_default:
+        manual_viewer_worker = ManualViewerOpenWorker(db=db, cfg=cfg, stop_event=stop_event)
+        if manual_viewer_worker.available:
+            manual_viewer_worker.start()
+            print("Manual viewer worker: enabled")
+        else:
+            if manual_mode_default:
+                stop_event.set()
+                if observer is not None:
+                    observer.stop()
+                    observer.join(timeout=5)
+                db.close()
+                print(f"Manual viewer worker: required_but_unavailable | err={manual_viewer_worker.unavailable_reason}")
+                return 8
+            print(f"Manual viewer worker: unavailable | err={manual_viewer_worker.unavailable_reason}")
+    else:
+        print("Manual viewer worker: disabled")
 
     last_reconcile = 0.0
     try:
@@ -5739,6 +6702,8 @@ def main() -> int:
         stop_event.set()
         if ui_worker is not None and ui_worker.is_alive():
             ui_worker.join(timeout=5)
+        if manual_viewer_worker is not None and manual_viewer_worker.is_alive():
+            manual_viewer_worker.join(timeout=5)
         if observer is not None:
             observer.stop()
             observer.join(timeout=5)

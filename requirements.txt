@@ -1,7 +1,10 @@
 openpyxl>=3.1
 Pillow>=10.0
+pillow-heif>=0.18
 watchdog>=4.0
-rapidocr-onnxruntime>=1.4
+rapidocr-onnxruntime
+opencv-python>=4.8
+pycryptodome>=3.20
 pywxdump>=3.1
 google-auth>=2.0
 gspread>=6.0

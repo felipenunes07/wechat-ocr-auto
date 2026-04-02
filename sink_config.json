@@ -7,7 +7,7 @@
   "original_wait_seconds": 7,
   "temp_correlation_seconds": 30,
   "thumb_candidates_enabled": false,
-  "manual_order_guard_enabled": false,
+  "manual_order_guard_enabled": true,
   "manual_burst_gap_seconds": 2,
   "manual_burst_max_seconds": 8,
   "db_merge_path": ".runtime\\wechat_merge.db",

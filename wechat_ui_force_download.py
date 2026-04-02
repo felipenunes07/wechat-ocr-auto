@@ -15,7 +15,14 @@ MAIN_WINDOW_CLASS = "WeChatMainWndForPC"
 MAIN_WINDOW_RETRY_ATTEMPTS = 3
 MAIN_WINDOW_RETRY_DELAY_SECONDS = 1.5
 DEFAULT_WINDOW_BACKENDS = ("win32", "uia")
-DEFAULT_MAIN_WINDOW_CLASSES = (MAIN_WINDOW_CLASS, "Base_PowerMessageWindow", "Chrome_WidgetWin_0")
+DEFAULT_MAIN_WINDOW_CLASSES = (
+    MAIN_WINDOW_CLASS,
+    "mmui::MainWindow",
+    "Qt51514QWindowIcon",
+    "Base_PowerMessageWindow",
+    "Chrome_WidgetWin_0",
+)
+MAIN_WINDOW_TITLE_MARKERS = ("wechat", "weixin")
 CLASSIC_VIEWER_CLASSES = {"WeChatAppEx", "Chrome_WidgetWin_0"}
 HOVER_WINDOW_CLASSES = {"HttpImgHoverWnd", "Search2Wnd"}
 CONVERSATION_PARENT_MARKERS = {"会话", "conversation"}
@@ -249,6 +256,22 @@ class WeChatUIForceDownloader:
                     continue
                 for window in windows:
                     out.append((backend, class_name, window))
+        if out:
+            return out
+        for backend in self.window_backends:
+            desktop = self._desktop_for_backend(backend)
+            try:
+                windows = desktop.windows(visible_only=False)
+            except Exception:
+                continue
+            for window in windows:
+                class_name = self._safe_class_name(window)
+                title = normalize_ui_text(self._safe_window_text(window))
+                if class_name in {"mmui::MainWindow", "Qt51514QWindowIcon"}:
+                    out.append((backend, class_name, window))
+                    continue
+                if any(marker in title for marker in MAIN_WINDOW_TITLE_MARKERS):
+                    out.append((backend, class_name or "title_fallback", window))
         return out
 
     def _probe_main_window_once(self) -> MainWindowProbeResult:
@@ -328,6 +351,25 @@ class WeChatUIForceDownloader:
     ) -> tuple[bool, str]:
         result = self._probe_main_window(retries=retries, retry_delay=retry_delay)
         return bool(result.ready), result.note
+
+    def probe_viewer_window(self) -> tuple[bool, Optional[int], str]:
+        main_result = self._probe_main_window(retries=1, retry_delay=0.1)
+        if main_result.window is None:
+            return False, None, f"main_window_unavailable|{main_result.note}"
+        try:
+            main_handle = int(main_result.window.handle)
+        except Exception:
+            return False, None, f"main_window_handle_unavailable|{main_result.note}"
+        viewer = self._classic_viewer_window(main_handle)
+        if viewer is None:
+            return False, None, f"viewer_closed|{main_result.note}"
+        try:
+            viewer_handle = int(viewer.handle)
+        except Exception:
+            viewer_handle = None
+        if viewer_handle is None:
+            return False, None, f"viewer_handle_unavailable|{main_result.note}"
+        return True, viewer_handle, f"viewer_open|main={main_handle}|viewer={viewer_handle}"
 
     def _main_window(self) -> Any:
         result = self._probe_main_window()

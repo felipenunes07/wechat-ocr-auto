@@ -9,23 +9,45 @@ $logErr = Join-Path $dir "wechat_receipt.err.log"
 $log = $logOut
 $pidf = Join-Path $dir "wechat_receipt.pid"
 
-# Prefer the project venv python, but fall back to system python if needed.
 $py = Join-Path $dir ".venv\\Scripts\\python.exe"
-if (!(Test-Path $py)) { $py = "python" }
+if (!(Test-Path $py)) {
+  throw "Python da venv nao encontrado: $py"
+}
+
+$pyVersion = (& $py -X utf8 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
+if ($LASTEXITCODE -ne 0) {
+  throw "Falha ao consultar a versao do Python da venv."
+}
+if ($pyVersion -ne "3.12") {
+  throw "Este projeto exige Python 3.12 na .venv. Versao atual detectada: $pyVersion"
+}
 
 function Get-WeChatFileStorageRoot {
   $doc = [Environment]::GetFolderPath("MyDocuments")
   $wechatFiles = Join-Path $doc "WeChat Files"
-  if (!(Test-Path $wechatFiles)) { return $null }
+  $xwechatFiles = Join-Path $doc "xwechat_files"
 
-  # Pick the most recently changed account folder that has FileStorage.
-  $accounts = Get-ChildItem -Path $wechatFiles -Directory -ErrorAction SilentlyContinue | Where-Object {
-    Test-Path (Join-Path $_.FullName "FileStorage")
-  } | Sort-Object LastWriteTime -Descending
+  if (Test-Path $xwechatFiles) {
+    $accounts = Get-ChildItem -Path $xwechatFiles -Directory -ErrorAction SilentlyContinue | Where-Object {
+      $_.Name -like "wxid_*" -and (Test-Path (Join-Path $_.FullName "msg\attach"))
+    } | Sort-Object LastWriteTime -Descending
 
-  if ($accounts -and $accounts.Count -gt 0) {
-    return (Join-Path $accounts[0].FullName "FileStorage")
+    if ($accounts -and $accounts.Count -gt 0) {
+      return $accounts[0].FullName
+    }
   }
+
+  if (Test-Path $wechatFiles) {
+    # Pick the most recently changed account folder that has FileStorage.
+    $accounts = Get-ChildItem -Path $wechatFiles -Directory -ErrorAction SilentlyContinue | Where-Object {
+      Test-Path (Join-Path $_.FullName "FileStorage")
+    } | Sort-Object LastWriteTime -Descending
+
+    if ($accounts -and $accounts.Count -gt 0) {
+      return (Join-Path $accounts[0].FullName "FileStorage")
+    }
+  }
+
   return $null
 }
 
@@ -35,18 +57,47 @@ function Convert-ToCliArg([string]$value) {
   return '"' + ($value -replace '(\\*)"', '$1$1\"') + '"'
 }
 
+function Invoke-EnvironmentHealthCheck {
+  $healthScript = @'
+import importlib
+modules = [
+    ("pywxdump", "pywxdump"),
+    ("pywinauto", "pywinauto"),
+    ("watchdog", "watchdog"),
+    ("rapidocr_onnxruntime", "rapidocr_onnxruntime"),
+    ("PIL", "PIL"),
+]
+errors = []
+for label, module_name in modules:
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:
+        errors.append(f"{label}:{type(exc).__name__}:{exc}")
+if errors:
+    print("ERROR:" + " | ".join(errors))
+    raise SystemExit(1)
+print("OK:env_health")
+'@
+  $output = $healthScript | & $py -X utf8 -
+  if ($LASTEXITCODE -ne 0) {
+    $message = (($output | Out-String).Trim())
+    if ([string]::IsNullOrWhiteSpace($message)) { $message = "env_health_failed" }
+    throw "Health-check do ambiente falhou: $message"
+  }
+}
+
 $watch = Get-WeChatFileStorageRoot
 
 if (!(Test-Path $script)) { throw "Script nao encontrado: $script" }
 if (!$watch -or !(Test-Path $watch)) {
-  throw "Pasta WeChat nao encontrada. Verifique se existe 'Documentos\\WeChat Files\\<wxid>\\FileStorage'."
+  throw "Pasta WeChat nao encontrada. Verifique se existe 'Documentos\WeChat Files\<wxid>\FileStorage' ou 'Documentos\xwechat_files\<wxid>'."
 }
 
 $sinkMode = "excel"
 $gsheetRef = ""
 $gsheetWorksheet = ""
 $gsheetReviewWorksheet = ""
-$recentFilesHours = 24
+$recentFilesHours = 0
 $originalWaitSeconds = 90
 $tempCorrelationSeconds = 30
 $thumbCandidatesEnabled = $false
@@ -63,7 +114,7 @@ $uiBatchMode = "group-sequential"
 $uiItemTimeoutSeconds = 5
 $uiRetryBackoffSeconds = "5,10,20,40"
 $uiWindowBackends = "win32,uia"
-$uiWindowClasses = "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_0"
+$uiWindowClasses = "WeChatMainWndForPC,mmui::MainWindow,Qt51514QWindowIcon,Base_PowerMessageWindow,Chrome_WidgetWin_0"
 $sheetOrderScope = "per_talker"
 $sheetMaterializationOrder = "desc"
 $sheetCommitOrder = "asc"
@@ -110,13 +161,46 @@ if (-not [System.IO.Path]::IsPathRooted($dbMergePath)) {
   $dbMergePath = Join-Path $dir $dbMergePath
 }
 
+if (-not $uiForceDownloadEnabled -and -not $manualOrderGuardEnabled) {
+  throw "Modo manual exige manual_order_guard_enabled=true em sink_config.json."
+}
+if (-not $uiForceDownloadEnabled) {
+  $manualOrderGuardEnabled = $true
+}
+
+Invoke-EnvironmentHealthCheck
+
 # Atualiza automaticamente o mapa hash->nome de grupo antes de iniciar.
 $mapUpdater = Join-Path $dir "refresh_group_map.py"
+$dbResolverReady = $true
 if (Test-Path $mapUpdater) {
-  & $py -X utf8 $mapUpdater
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warning "refresh_group_map.py falhou (exit=$LASTEXITCODE). Continuando inicializacao em modo resiliente."
+  $runtimeDir = Join-Path $dir ".runtime"
+  if (!(Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir | Out-Null }
+  $mapStdOut = Join-Path $runtimeDir "refresh_group_map.stdout.log"
+  $mapStdErr = Join-Path $runtimeDir "refresh_group_map.stderr.log"
+  Remove-Item -LiteralPath $mapStdOut, $mapStdErr -ErrorAction SilentlyContinue
+  $mapProc = Start-Process -FilePath $py -ArgumentList @("-X", "utf8", ('"' + $mapUpdater + '"')) -WorkingDirectory $dir -NoNewWindow -RedirectStandardOutput $mapStdOut -RedirectStandardError $mapStdErr -Wait -PassThru
+  $mapExitCode = $mapProc.ExitCode
+  $mapOutput = @()
+  if (Test-Path $mapStdOut) { $mapOutput += Get-Content -Path $mapStdOut -ErrorAction SilentlyContinue }
+  if (Test-Path $mapStdErr) { $mapOutput += Get-Content -Path $mapStdErr -ErrorAction SilentlyContinue }
+  if ($mapOutput) {
+    $mapOutput | ForEach-Object { Write-Output $_ }
   }
+  if ($mapExitCode -ne 0) {
+    $dbResolverReady = $false
+    if ($resolutionMode -eq "db-first" -and -not $uiForceDownloadEnabled) {
+      Write-Warning "refresh_group_map.py falhou no WeChat 4 atual. Iniciando fallback seguro em path-only viewer-only; nomes automaticos de grupo ficam indisponiveis por enquanto."
+      $resolutionMode = "path-only"
+    } elseif ($resolutionMode -eq "db-first") {
+      throw "refresh_group_map.py falhou em modo db-first (exit=$mapExitCode). Inicializacao abortada."
+    }
+    if ($resolutionMode -ne "path-only") {
+      Write-Warning "refresh_group_map.py falhou (exit=$mapExitCode)."
+    }
+  }
+} elseif ($resolutionMode -eq "db-first") {
+  throw "refresh_group_map.py nao encontrado e resolution_mode=db-first exige merge DB valido."
 }
 
 if (Test-Path $pidf) {
