@@ -1371,7 +1371,7 @@ class WeChatDBResolver:
         self.wechat_root = self.wx_dirs[0].parent if self.wx_dirs else None
         self.merge_path = merge_path.resolve()
         self.refresh_seconds = max(5, int(refresh_seconds))
-        self.merge_timeout_seconds = 12
+        self.merge_timeout_seconds = 60
         self.failure_backoff_seconds = max(30, self.refresh_seconds, self.merge_timeout_seconds * 2)
         self._pywxdump: Any = None
         self._decode_bytes_extra: Any = None
@@ -5314,22 +5314,15 @@ def backfill_missing_receipt_fields(db: StateDB, sink: RowSink, cfg: Config, lim
         )
         updated += 1
 
-        row_idx = row["excel_row"]
-        if str(row["sheet_status"] or "").strip() == "SINK_COMMITTED" and row_idx is not None:
-            try:
-                sink.update_row(
-                    sheet_name=str(row["excel_sheet"] or "").strip(),
-                    row_idx=int(row_idx),
-                    row_payload=sheet_payload,
-                    review_needed=review_needed,
-                )
-                sheet_updated += 1
-            except Exception as exc:
-                sheet_failed += 1
-                print(
-                    f"[WARN] backfill_sheet_update_failed | file_id={row['file_id']} "
-                    f"| sheet={row['excel_sheet']} | row={row_idx} | err={type(exc).__name__}: {exc}"
-                )
+        # We intentionally do NOT update the sheet during backfill if it's already SINK_COMMITTED.
+        # This prevents overwriting manual user corrections or changing the 'Banco' field 
+        # unexpectedly during startup when re-parsing happens.
+        # Original logic removed:
+        # row_idx = row["excel_row"]
+        # if str(row["sheet_status"] or "").strip() == "SINK_COMMITTED" and row_idx is not None:
+        #    try:
+        #        sink.update_row(...)
+
 
     return (updated, sheet_updated, sheet_failed)
 
