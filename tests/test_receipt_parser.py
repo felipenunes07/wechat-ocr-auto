@@ -1,8 +1,10 @@
+import hashlib
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -11,6 +13,8 @@ from wechat_receipt_daemon import (
     IGNORED_SESSION_ROLLOVER_STATE,
     SESSION_PENDING_OPEN_STATE,
     GoogleSheetsSink,
+    MediaResolution,
+    QueueItem,
     StateDB,
     WeChatDBResolver,
     WeChatMessageRef,
@@ -22,6 +26,7 @@ from wechat_receipt_daemon import (
     normalize_client_label,
     parse_receipt_fields,
     prepare_image_for_ocr,
+    process_item,
     round_amount_for_output,
     runtime_media_resolver,
     seed_ready_manual_session_placeholders,
@@ -34,6 +39,7 @@ class NormalizeAmountTests(unittest.TestCase):
         self.assertEqual(normalize_amount("30.000"), 30000.0)
         self.assertEqual(normalize_amount("2.525"), 2525.0)
         self.assertEqual(normalize_amount("6.60102"), 6601.02)
+        self.assertEqual(normalize_amount("1.392.16"), 1392.16)
 
     def test_decimal_values_keep_fraction(self) -> None:
         self.assertEqual(normalize_amount("2,5"), 2.5)
@@ -299,6 +305,80 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertEqual(fields["amount_rounded"], 30.0)
         self.assertEqual(fields["amount_source"], "currency")
 
+    def test_parses_double_dot_currency_and_ignores_inline_cnpj_root(self) -> None:
+        text = "\n".join(
+            [
+                "Comprovantede",
+                "transferencia",
+                "30ABR2026-18:04:04",
+                "Valor",
+                "R$1.392.16",
+                "Tipodetransferencia",
+                "Pix",
+                "IDdatransacao",
+                "E182361202026043",
+                "02101s17c30c686e",
+                "Destino",
+                "Nome",
+                "CLEENDELETRONICOS",
+                "CNPJ",
+                "61964978000168",
+                "Instituicao",
+                "BCOBRADESCOS.A",
+                "ChavePix",
+                "+5511976266666",
+                "Origem",
+                "Nome",
+                "JudithPierre",
+                "Instituicao",
+                "NUPAGAMENTOS-IP",
+                "CPF",
+                "...373.011..",
+                "NuPagamentosS.A.-InstituicaodePagamento",
+                "CNPJ18.236.120/0001-58",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 1392.16)
+        self.assertEqual(fields["amount_rounded"], 1392.0)
+        self.assertEqual(fields["amount_source"], "currency")
+
+    def test_prefers_real_value_when_inline_provider_cnpj_appears_later(self) -> None:
+        text = "\n".join(
+            [
+                "infinitepay",
+                "Comprovante de transferencia Pix",
+                "RS",
+                "160,00",
+                "2Mai,2026·12:47",
+                "Origem",
+                "CAIO RAMON BARBOSADOSSANTOS",
+                "CPF",
+                ".··.817.484-..",
+                "Instituicao",
+                "CLOUDWALKIPLTDA",
+                "Destino",
+                "AMDREPRESENTACOESESERVICOSLTDA",
+                "CNPJ",
+                "53.356.830/0001-12",
+                "Instituicao",
+                "BCODOBRASILS.A.",
+                "Chave Pix",
+                "53356830000112",
+                "IDE18189547202605021547CXqR4yA3dRz",
+                "CloudwalkInstituicaodePagamento",
+                "CNPJ-18.189.547/0001-42",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 160.0)
+        self.assertEqual(fields["amount_rounded"], 160.0)
+        self.assertEqual(fields["amount_source"], "fallback")
+
     def test_falls_back_to_today_and_dash_when_datetime_missing(self) -> None:
         text = "\n".join(
             [
@@ -495,6 +575,133 @@ class FakeMediaResolver:
 
     def resolve_talker_display_name(self, talker: str | None) -> str | None:
         return str(talker or "").strip() or None
+
+
+class RepeatedReceiptProcessingTests(unittest.TestCase):
+    def test_process_item_keeps_repeated_receipt_with_same_sha_when_message_is_different(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            image_path = root / "MsgAttach" / "gid" / "Image" / "2026-03" / "repeat.dat"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"same-image")
+            duplicate_digest = hashlib.sha256(b"same-image").hexdigest()
+
+            db = StateDB(root / "state.db")
+            try:
+                existing_payload = build_receipt_payload(
+                    file_id="existing-file",
+                    ingested_at=1000.0,
+                    msg_svr_id="msg-old",
+                    msg_create_time=100.0,
+                    amount=668.04,
+                    amount_rounded=668.0,
+                )
+                existing_payload["sha256"] = duplicate_digest
+                db.insert_receipt(existing_payload)
+
+                insert_file_row(
+                    db,
+                    file_id="new-file",
+                    path=str(image_path),
+                    source_kind="msgattach_image_dat",
+                    status="pending",
+                    first_seen=2000.0,
+                    last_error=None,
+                    msg_svr_id="msg-new",
+                    talker="27837425841@chatroom",
+                    msg_create_time=200.0,
+                )
+
+                item = QueueItem(
+                    file_id="new-file",
+                    path=str(image_path),
+                    source_kind="msgattach_image_dat",
+                    ext=".dat",
+                    size=image_path.stat().st_size,
+                    mtime=2000.0,
+                    first_seen=2000.0,
+                    attempts=0,
+                    msg_svr_id="msg-new",
+                    talker="27837425841@chatroom",
+                    msg_create_time=200.0,
+                )
+                msg_ref = WeChatMessageRef(
+                    msg_svr_id="msg-new",
+                    talker="27837425841@chatroom",
+                    create_time=200.0,
+                    sender_user_name="wxid_cliente_real",
+                    sender_display="Cliente Real",
+                    image_rel_path=None,
+                    thumb_rel_path=None,
+                    image_abs_path=image_path,
+                    thumb_abs_path=None,
+                )
+                resolution = MediaResolution(
+                    original_source_path=image_path,
+                    original_source_kind="msgattach_image_dat",
+                    resolved_path=image_path,
+                    resolved_source_kind="msgattach_image_dat",
+                    client_source_path=image_path,
+                    resolution_source="db_image",
+                    verification_status="CONFIRMADO",
+                    msg_ref=msg_ref,
+                )
+                fake_fields = {
+                    "txn_date": "20/03/2026",
+                    "txn_time": "11:35",
+                    "txn_date_source": "parsed",
+                    "txn_time_source": "parsed",
+                    "beneficiary": "Cliente",
+                    "bank": "CLEEND",
+                    "amount": 668.04,
+                    "amount_raw": "668.04",
+                    "amount_rounded": 668.0,
+                    "amount_source": "currency",
+                    "currency": "BRL",
+                    "parse_conf": 0.99,
+                }
+                resolver = SimpleNamespace(
+                    resolve=lambda _source_path: "65",
+                    ignore_reason=lambda _source_path: None,
+                )
+                ocr = SimpleNamespace(
+                    name="fake-ocr",
+                    extract=lambda _img: ("Comprovante de Pix", 0.99),
+                )
+                cfg = SimpleNamespace(min_confidence=0.5)
+
+                with patch("wechat_receipt_daemon.resolve_media_candidate", return_value=resolution), patch(
+                    "wechat_receipt_daemon.open_image_from_file",
+                    return_value=(Image.new("RGB", (20, 20), "white"), b"same-image", ".dat", None),
+                ), patch(
+                    "wechat_receipt_daemon.prepare_image_for_ocr",
+                    side_effect=lambda img, _source_kind: img,
+                ), patch(
+                    "wechat_receipt_daemon.quality_score",
+                    return_value=0.95,
+                ), patch(
+                    "wechat_receipt_daemon.looks_like_single_receipt",
+                    return_value=(True, ""),
+                ), patch(
+                    "wechat_receipt_daemon.parse_receipt_fields",
+                    return_value=fake_fields,
+                ):
+                    process_item(item, db, object(), ocr, resolver, None, cfg)
+
+                total_with_same_sha = db._conn.execute(
+                    "SELECT COUNT(*) FROM receipts WHERE sha256=?",
+                    (duplicate_digest,),
+                ).fetchone()[0]
+                new_receipt = db._conn.execute(
+                    "SELECT file_id, msg_svr_id, sheet_status FROM receipts WHERE file_id='new-file'"
+                ).fetchone()
+
+                self.assertEqual(total_with_same_sha, 2)
+                self.assertIsNotNone(new_receipt)
+                self.assertEqual(new_receipt["msg_svr_id"], "msg-new")
+                self.assertEqual(new_receipt["sheet_status"], "SINK_PENDING")
+            finally:
+                db.close()
 
 
 class CandidateFilterTests(unittest.TestCase):

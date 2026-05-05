@@ -446,6 +446,18 @@ AMOUNT_NEGATIVE_HINTS = (
     "protocolo",
     "id",
 )
+DOCUMENT_NUMBER_CONTEXT_HINTS = (
+    "cnpj",
+    "cpf",
+    "chavepix",
+    "iddatransacao",
+    "transacaoid",
+    "protocolo",
+    "telefone",
+    "ouvidoria",
+    "agencia",
+    "conta",
+)
 MONTH_TOKEN_MAP = {
     "JAN": 1,
     "JANEIRO": 1,
@@ -923,6 +935,8 @@ def normalize_amount(value: str) -> Optional[float]:
     grouped_thousands_dot = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s))
     grouped_thousands_comma_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d{2}", s))
     grouped_thousands_dot_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d{2}", s))
+    repeated_dot_decimal = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\.\d{1,2}", s))
+    repeated_comma_decimal = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+,\d{1,2}", s))
 
     if grouped_thousands_comma_compact_cent:
         s = s.replace(",", "")
@@ -930,6 +944,12 @@ def normalize_amount(value: str) -> Optional[float]:
     elif grouped_thousands_dot_compact_cent:
         s = s.replace(".", "")
         s = f"{s[:-2]}.{s[-2:]}"
+    elif repeated_dot_decimal:
+        integer_part, decimal_part = s.rsplit(".", 1)
+        s = f"{integer_part.replace('.', '')}.{decimal_part}"
+    elif repeated_comma_decimal:
+        integer_part, decimal_part = s.rsplit(",", 1)
+        s = f"{integer_part.replace(',', '')}.{decimal_part}"
     elif "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
@@ -998,8 +1018,17 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
         next_low = lines[idx + 1].lower() if idx + 1 < len(lines) else ""
         next2_low = lines[idx + 2].lower() if idx + 2 < len(lines) else ""
         context_low = " ".join(part for part in (prev2_low, prev_low, line_low, next_low, next2_low) if part)
+        compact_prev_low = re.sub(r"[^a-z0-9]+", "", prev_low)
+        compact_line_low = re.sub(r"[^a-z0-9]+", "", line_low)
+        compact_next_low = re.sub(r"[^a-z0-9]+", "", next_low)
         has_direct_hint = any(token in part for part in (prev_low, line_low, next_low) for token in AMOUNT_DIRECT_HINTS)
         has_negative_hint = any(token in context_low for token in AMOUNT_NEGATIVE_HINTS)
+        line_has_document_hint = any(token in compact_line_low for token in DOCUMENT_NUMBER_CONTEXT_HINTS)
+        adjacent_document_hint = any(
+            token in compact_part
+            for compact_part in (compact_prev_low, compact_next_low)
+            for token in DOCUMENT_NUMBER_CONTEXT_HINTS
+        )
 
         def score_candidate(raw_value: str, currency: Optional[str], source: str, used_compact_fix: bool) -> int:
             score = 30 if source == "currency" else 18
@@ -1027,12 +1056,20 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             del currency
             if source != "fallback":
                 return False
+            embedded_document_number = bool(re.search(rf"{re.escape(raw_value)}\s*[/:-]\s*\d", line_low))
+            digits = re.sub(r"\D", "", raw_value or "")
+            has_fractional_tail = bool(re.search(r"[.,]\d{1,2}$", raw_value))
+            if embedded_document_number and line_has_document_hint:
+                return True
+            if line_has_document_hint and len(digits) >= 6 and not has_fractional_tail:
+                return True
+            if adjacent_document_hint and len(digits) >= 10 and not has_fractional_tail:
+                return True
             if not has_negative_hint or has_direct_hint:
                 return False
-            digits = re.sub(r"\D", "", raw_value or "")
             if len(digits) < 6:
                 return False
-            if re.search(r"[.,]\d{1,2}$", raw_value):
+            if has_fractional_tail:
                 return False
             return True
 
@@ -5031,11 +5068,8 @@ def process_item(
         img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
-        if db.receipt_sha_exists(digest):
-            db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
-            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
-            print(f"[SKIP] {path.name} | duplicate_sha")
-            return
+        # The client may legitimately send the same receipt image more than once.
+        # Keep binary hashes for traceability, but do not use them to suppress ingest.
         q_score = quality_score(img)
 
         prep_started_at = time.perf_counter()
